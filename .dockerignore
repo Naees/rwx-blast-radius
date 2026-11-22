@@ -1,0 +1,6 @@
+*
+!*.cpp
+!*.hpp
+!Makefile
+!Dockerfile
+!launcher.c

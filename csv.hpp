@@ -120,6 +120,16 @@ inline bool parse_csv(std::string_view line, std::array<std::string_view, N>& fi
     return true;
 }
 
+inline uint32_t parse_price(std::string_view s) {
+    uint32_t n = 0;
+    for (unsigned char c : s) {
+        unsigned digit = c - unsigned('0');
+        if (digit > 9 || n > 1000000) return 0;
+        n = n * 10 + digit;
+    }
+    return n <= 10000000 ? n : 0;
+}
+
 inline constexpr int64_t invalid_timestamp = std::numeric_limits<int64_t>::min();
 
 inline unsigned digit_pair(const char* p) {

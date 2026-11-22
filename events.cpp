@@ -1,23 +1,19 @@
 #include "events.hpp"
 #include "csv.hpp"
+#include "event_jobs.hpp"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
-#include <functional>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <system_error>
-#include <thread>
 #include <unistd.h>
 
 namespace shop {
@@ -27,28 +23,6 @@ constexpr uint32_t absent = UINT32_MAX;
 constexpr uint32_t detail_mask = (1u << 28) - 1;
 constexpr size_t block_rows = 1024;
 constexpr size_t input_chunk = 1 << 20;
-
-template<class Function>
-void run_jobs(size_t threads, size_t count, Function function) {
-    std::atomic<size_t> next{0};
-    std::exception_ptr failure;
-    std::mutex mutex;
-    auto body = [&](size_t worker) {
-        try {
-            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < count;)
-                function(worker, i);
-        } catch (...) {
-            next.store(count, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> guard(mutex);
-            if (!failure) failure = std::current_exception();
-        }
-    };
-    std::vector<std::thread> pool;
-    for (size_t i = 1; i < std::min(count, threads); ++i) pool.emplace_back(body, i);
-    body(0);
-    for (auto& t : pool) t.join();
-    if (failure) std::rethrow_exception(failure);
-}
 
 template<class T>
 T load(const char* p) {
@@ -283,16 +257,6 @@ struct IngestDates {
         return item.seconds + digit_pair(p + 11) * 3600 + digit_pair(p + 14) * 60 + digit_pair(p + 17);
     }
 };
-uint32_t parse_price(std::string_view s) {
-    uint32_t n = 0;
-    for (unsigned char c : s) {
-        unsigned digit = c - unsigned('0');
-        if (digit > 9 || n > 1000000) return 0;
-        n = n * 10 + digit;
-    }
-    return n <= 10000000 ? n : 0;
-}
-
 struct alignas(128) Reader {
     std::vector<Partition> partitions;
     std::vector<char> buffer;

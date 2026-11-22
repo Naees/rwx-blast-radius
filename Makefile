@@ -3,7 +3,7 @@ ARROW_DIR ?= $(shell $(PYTHON) -c "import importlib.util; print(importlib.util.f
 BUILD ?= .local
 CXXFLAGS ?= -O3 -DNDEBUG
 CPPFLAGS += -isystem "$(ARROW_DIR)/include"
-SOURCES := main.cpp events.cpp inputs.cpp aggregate.cpp output.cpp
+SOURCES := main.cpp events.cpp ordered_events.cpp inputs.cpp aggregate.cpp output.cpp
 OBJECTS := $(patsubst %.cpp,$(BUILD)/%.o,$(SOURCES))
 ifeq ($(shell uname -s),Darwin)
 LIB_SUFFIX := .2100.dylib

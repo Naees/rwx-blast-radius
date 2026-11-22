@@ -1,5 +1,8 @@
 """Recognize equivalent operations on local containers of a proven built-in type."""
 import ast
+import types
+from functools import lru_cache
+from impact import source_window, _equal
 
 
 SEQUENCES = (ast.List, ast.ListComp, ast.Tuple, ast.Dict, ast.DictComp, ast.Set, ast.SetComp)
@@ -72,14 +75,34 @@ def argument(call, name):
         return call.args[0]
 
 
+def builtin_names(tree):
+    nodes = ast.walk(tree)
+    allowed = set(BUILTINS)
+    for n in nodes:
+        if ((isinstance(n, ast.alias) and n.name == "*")
+                or (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in REFLECTION)
+                or (isinstance(n, ast.Attribute) and n.attr in REFLECTION)):
+            return set()
+        allowed.difference_update(bindings(n))
+    # A local with a name like 'vars' is ordinary data. co_names distinguishes
+    # global or attribute references from fast locals and closure variables.
+    codes = [compile(tree, "<bindings>", "exec")]
+    while codes:
+        code = codes.pop()
+        if REFLECTION.intersection(code.co_names):
+            return set()
+        codes.extend(value for value in code.co_consts if isinstance(value, types.CodeType))
+    return allowed
+
+
+@lru_cache(maxsize=8)
+def file_builtins(source):
+    return builtin_names(ast.parse(source))
+
+
 class Normalize(ast.NodeTransformer):
-    def __init__(self, tree):
-        nodes = list(ast.walk(tree))
-        self.builtins = BUILTINS - {name for node in nodes for name in bindings(node)}
-        if any((isinstance(n, ast.alias) and n.name == "*")
-               or (isinstance(n, ast.Name) and n.id in REFLECTION)
-               or (isinstance(n, ast.Attribute) and n.attr in REFLECTION) for n in nodes):
-            self.builtins.clear()
+    def __init__(self, allowed):
+        self.builtins = allowed
         self.types = {}
 
     def visit_FunctionDef(self, node):
@@ -96,12 +119,20 @@ class Normalize(ast.NodeTransformer):
         self.types = previous
         return node
 
-    def visit_If(self, node):
-        test = node.test
+    def condition(self, test):
+        # Every operand of an and/or used directly as a branch condition
+        # is consumed only for its truth, including the final operand.
+        if isinstance(test, ast.BoolOp):
+            test.values = [self.condition(child) for child in test.values]
+            return test
+        original = test
         name = None
         negate = False
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
             negate, test = True, test.operand
+            if isinstance(test, ast.BoolOp):
+                original.operand = self.condition(test)
+                return original
         if "bool" in self.builtins:
             name = argument(test, "bool")
         if "len" in self.builtins:
@@ -113,7 +144,11 @@ class Normalize(ast.NodeTransformer):
                 name = argument(test.left, "len")
                 negate ^= isinstance(test.ops[0], ast.Eq)
         if name and name.id in self.types:
-            node.test = ast.UnaryOp(op=ast.Not(), operand=name) if negate else name
+            return ast.UnaryOp(op=ast.Not(), operand=name) if negate else name
+        return original
+
+    def visit_If(self, node):
+        node.test = self.condition(node.test)
         return self.generic_visit(node)
 
     visit_While = visit_If
@@ -140,11 +175,16 @@ def equivalent(patch, source):
              and any("len(" in line or "bool(" in line for line in lines))
     if not (reverse or truth):
         return False
-    new = patch.apply(source)
-    trees = [ast.parse(source), ast.parse(new)]
-    # ast.parse accepts constructs that the compiler rejects, including jumps
-    # outside a loop and invalid declarations.
-    compile(trees[1], "<changed source>", "exec")
+    old, new = source_window(patch, source, patch.apply(source))
+    trees = [ast.parse(old), ast.parse(new)]
+    try:
+        compile(trees[1], "<changed source>", "exec")
+    except (SyntaxError, ValueError):
+        return False
+    available = file_builtins(source) if old != source else builtin_names(trees[0])
+    available = available & builtin_names(trees[1])
+    if not available:
+        return False
     for tree in trees:
-        Normalize(tree).visit(tree)
-    return ast.dump(trees[0]) == ast.dump(trees[1])
+        Normalize(available).visit(tree)
+    return _equal(trees[0], trees[1])

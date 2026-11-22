@@ -3,6 +3,7 @@ import unittest
 
 from container_refactors import equivalent
 from impact import parse_patch
+from unittest.mock import patch as replace
 
 
 def proven(source, before, after):
@@ -37,3 +38,20 @@ class ContainerRefactorsTest(unittest.TestCase):
         src = "def f():\n    xs = []\n    if not xs:\n        return 1\n"
         self.assertTrue(proven(src, "if not xs:", "if len(xs) == 0:"))
         self.assertFalse(proven(src, "if not xs:\n        return 1", "if len(xs) == 0:\n        return 2"))
+
+    def test_short_circuit_truth_only_and_shadowed_module_names(self):
+        src = "def f(ready):\n    xs = []\n    if ready and xs:\n        return ready or xs\n"
+        self.assertTrue(proven(src, "ready and xs:", "ready and len(xs):"))
+        self.assertFalse(proven(src, "return ready or xs", "return ready or len(xs)"))
+        self.assertFalse(proven(src, "if ready and xs:", "if len(xs) and ready:"))
+        # A cached scope window omits surrounding imports. They still determine
+        # which callable the bare name resolves to inside this function.
+        shadowed = "from example import len\n" + src
+        with replace("container_refactors.source_window",
+                     return_value=(src, src.replace("ready and xs:", "ready and len(xs):"))):
+            self.assertFalse(proven(shadowed, "ready and xs:", "ready and len(xs):"))
+
+    def test_local_named_vars_and_reflection_alias_are_distinct(self):
+        src = "def other():\n    vars = [1]\n    return vars\ndef f():\n    xs = []\n    if xs:\n        return 1\n"
+        self.assertTrue(proven(src, "if xs:", "if len(xs):"))
+        self.assertFalse(proven("read_frame = vars\n" + src, "if xs:", "if len(xs):"))

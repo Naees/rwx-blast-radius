@@ -21,7 +21,7 @@ For edits to an `isinstance` check, the selector compares the old and new class 
 
 An integer index edit can leave a test unaffected when both indices refer to the same object in every observed list or tuple. A changed default can likewise leave a caller unaffected if it supplied an explicit argument. For expensive TPC tests, the selector also checks observed function signatures and object types before replaying optimizer stages.
 
-For a single-file edit, the selector can recognize equivalent emptiness checks on local containers created by literals or comprehensions. It also recognizes an in-place reversal of an exact list expressed through slice assignment. These checks inspect other assignments to the local and preserve tests that read the source itself.
+For a single-file edit, the selector can recognize equivalent emptiness checks on local containers created by literals or comprehensions. This includes operands of short-circuit conditions when the branch only consumes their truth value. It also recognizes an in-place reversal of an exact list expressed through slice assignment. These checks inspect other assignments to the local and preserve tests that read the source itself.
 
 The Boolean profiler can read a declared Python slot when it verifies the receiver class and the slot descriptor. For a direct call changed from positional to keyword arguments, the selector checks the callee, parameter binding and evaluation order. It retains tests that may replace the callable, inspect its code or run it in another process.
 

@@ -6,8 +6,10 @@ instrumented on import. No patched version of any source is loaded.
 A fresh invocation measures every inventory entry. To refresh specific test
 modules in an existing map, append --refresh-module tests/test_example.py
 (repeatable). The refresh removes older observations for each selected test;
-other tests retain their prior measurements. Older unknown operand categories
-in an incremental map conservatively keep those tests eligible.
+other tests retain their prior measurements. Use --identity-only with an existing
+map to rerun every inventory test while replacing just the identity comparisons.
+The recorder checks operands against the pinned class methods without invoking
+unknown user-defined comparisons.
 """
 
 import ast
@@ -27,14 +29,12 @@ from pathlib import Path
 import pytest
 
 from generate_map import PINNED, Recorder, TracedPool
+from identity_facts import IdentityFacts
 
 
 OPS = {"Eq": operator.eq, "NotEq": operator.ne, "Lt": operator.lt, "LtE": operator.le,
        "Gt": operator.gt, "GtE": operator.ge, "Is": operator.is_, "IsNot": operator.is_not}
 SCALARS = {int, bool, str, bytes, float}
-IDENTITY_EQ = {object.__eq__, type.__eq__, type(None).__eq__}
-BUILTIN_EQ = {str.__eq__, bytes.__eq__, int.__eq__, float.__eq__, tuple.__eq__,
-              list.__eq__, dict.__eq__, set.__eq__, frozenset.__eq__}
 
 
 def primitive(value):
@@ -46,19 +46,7 @@ def relation(left, right, original, result):
     # Each observation records identity plus one relationship: equality,
     # inequality, a total-order relationship, or unknown.
     same = left is right
-    if original in ("Is", "IsNot"):
-        left_eq, right_eq = type(left).__eq__, type(right).__eq__
-        if left_eq in IDENTITY_EQ and right_eq in IDENTITY_EQ:
-            rel = "=" if same else "!"
-        elif (left is None and right_eq in BUILTIN_EQ) or (right is None and left_eq in BUILTIN_EQ):
-            rel = "!"
-        elif left_eq is str.__eq__ and right_eq is str.__eq__:
-            rel = "=" if str.__eq__(left, right) else "!"
-        elif primitive(left) and primitive(right):
-            rel = "=" if left == right else "!"
-        else:
-            rel = "?"
-    elif original in ("Eq", "NotEq"):
+    if original in ("Eq", "NotEq"):
         rel = ("=" if result == (original == "Eq") else "!") if type(result) is bool else "?"
     elif primitive(left) and primitive(right) and type(result) is bool:
         if left == right:
@@ -79,6 +67,8 @@ class ObservationRecorder(Recorder):
         super().__init__(root, tests)
         self.sites = {}
         self.child_process_tests = 0
+        self.identity = IdentityFacts()
+        self.identity_only = False
 
     def activate(self, mask):
         self.active = mask
@@ -103,6 +93,14 @@ class ObservationRecorder(Recorder):
                 capture("T" if value else "F")
                 return value
             return boolean
+
+        if kind in ("Is", "IsNot"):
+            negate = kind == "IsNot"
+            def identity(left, right):
+                if self.active:
+                    capture(self.identity.state(left, right))
+                return (left is right) != negate
+            return identity
 
         op = OPS[kind]
         def compare(left, right):
@@ -162,12 +160,13 @@ class Instrument(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
-        if len(node.ops) == 1 and (kind := type(node.ops[0]).__name__) in OPS:
+        allowed = ("Is", "IsNot") if self.recorder.identity_only else OPS
+        if len(node.ops) == 1 and (kind := type(node.ops[0]).__name__) in allowed:
             return self.wrap(node, kind, [node.left, node.comparators[0]])
         return node
 
     def condition(self, node):
-        if isinstance(node, ast.BoolOp):
+        if isinstance(node, ast.BoolOp) and not self.recorder.identity_only:
             node.values = [self.condition(value) for value in node.values]
             return self.wrap(node, type(node.op).__name__, [node])
         return self.visit(node)
@@ -200,9 +199,13 @@ class ProbeLoader(importlib.abc.Loader):
     def exec_module(self, module):
         source = Path(self.origin).read_bytes()
         instrument = Instrument(self.recorder, self.recorder.relative(self.origin))
-        tree = instrument.visit(ast.parse(source, self.origin))
+        tree = ast.parse(source, self.origin)
+        gates = self.recorder.identity.type_gates(tree)
+        tree = instrument.visit(tree)
         module._br_condition_probes = instrument.probes
         exec(compile(ast.fix_missing_locations(tree), self.origin, "exec"), module.__dict__)
+        if gates:
+            self.recorder.identity.add_type_gates(module, gates)
 
 
 class ProbeFinder(importlib.abc.MetaPathFinder):
@@ -223,7 +226,10 @@ def main():
     parser.add_argument("root", type=Path)
     parser.add_argument("inventory", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--refresh-module", action="append", default=[])
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--refresh-module", action="append", default=[])
+    modes.add_argument("--identity-only", action="store_true",
+                       help="replace every identity site in a complete existing map")
     args = parser.parse_args()
     root, inventory, output = (p.resolve() for p in (args.root, args.inventory, args.output))
     revision = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
@@ -231,6 +237,14 @@ def main():
         raise ValueError("Expected a clean pinned SQLGlot checkout")
     tests = sorted(x["id"] for x in json.loads(inventory.read_text())["tests"])
     recorder = ObservationRecorder(root, tests)
+    previous_partial = set()
+    if args.identity_only:
+        recorder.resume(output)
+        previous_partial = set(recorder.only)
+        recorder.only = set(tests)
+        recorder.passed.clear()
+        recorder.identity_only = True
+        recorder.sites = {k: v for k, v in recorder.sites.items() if not k.endswith((":Is", ":IsNot"))}
     if args.refresh_module:
         recorder.resume(output)
         recorder.only.update(t for t in tests if t.split("::")[0] in args.refresh_module)
@@ -246,6 +260,7 @@ def main():
     if result not in (0, 1):
         raise SystemExit(result)
     temporary = output.with_suffix(".tmp")
+    recorder.failed.update(previous_partial)
     recorder.save(temporary)
     temporary.replace(output)
 

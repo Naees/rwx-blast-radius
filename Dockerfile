@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 COPY --from=source /sqlglot/sqlglot /sqlglot/sqlglot
 COPY --from=source /sqlglot/tests /sqlglot/tests
 WORKDIR /app
-COPY selector.py deps.py impact.py fixtures.py configmap.py observations.py mapdata.py ./
+COPY selector.py deps.py impact.py fixtures.py configmap.py observations.py mapdata.py numeric.py registries.py ./
 COPY maps/ ./maps/
 RUN python mapdata.py && python -m compileall -q /app
 CMD ["python", "selector.py"]

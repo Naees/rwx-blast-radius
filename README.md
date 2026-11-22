@@ -17,6 +17,8 @@ The dependency maps come from the unmodified SQLGlot revision `eb11aec4be8cb2122
 
 Separate maps track class attributes, registry lookups, fixture reads, Python files read as data, and code reached during imports. The profiler also follows serialized arguments and results at process-pool boundaries. The selector uses the measured test durations to compare one through eight worker schedules, including the two-second cost for each worker.
 
+For dictionary edits the profiler tracks individual key reads, including copies of dialect registries. For integer constants used only in supported branches it records the range within which each test takes the same path.
+
 The prediction is empirical. New control flow, dynamic imports and differences between profiling and scoring environments can affect recall. The organizer's sample answers are used only by the external scorer.
 
 ## Rebuild the maps
@@ -24,7 +26,8 @@ The prediction is empirical. New control flow, dynamic imports and differences b
 Use a clean checkout of the pinned revision and a CPython 3.13 virtual environment containing the test dependencies from the organizer's `requirements.lock`. Activate the environment so child interpreters resolve the same Python. From this repository, set `BASE` to the checkout and `TESTS` to the organizer's `tests.json`, then run the generators sequentially.
 
 ```sh
-export SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1
+mkdir -p .work
+export PYTHONHASHSEED=0 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1
 python generate_map.py "$BASE" "$TESTS" maps/deps.json.gz
 python observe_base.py "$BASE" "$TESTS" maps/observations.json.gz
 python generate_config.py "$BASE" "$TESTS" maps/config.json.gz
@@ -34,6 +37,9 @@ python generate_scopes.py "$BASE" maps/scopes.json.gz
 python generate_imports.py "$BASE" "$TESTS"
 python generate_initializers.py "$BASE" "$TESTS" maps/initializers.json.gz
 python fixtures.py "$BASE"
+python generate_numeric.py "$BASE" "$TESTS" maps/numeric.json.gz
+python generate_registries.py "$BASE" "$TESTS" .work/registry-all.json.gz
+python pack_registries.py "$BASE" maps/registries.json.gz .work/registry-all.json.gz
 ```
 
 The submitted image uses the committed maps. Docker fetches the pinned SQLGlot source and compiles the maps into a local cache during the build. Prediction uses the Python standard library.

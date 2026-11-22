@@ -11,7 +11,9 @@ from deps import Dependencies
 from fixtures import FixtureSelector
 from impact import analyze_python, parse_patch
 from mapdata import load as load_map
+from numeric import select as numeric_users
 from observations import Observations
+from registries import select as registry_users
 
 
 def schedule(tests):
@@ -36,6 +38,7 @@ class Selector:
         self.base = Path(base).resolve()
         self.inventory = {row["id"]: row for row in tests}
         self.all = set(self.inventory)
+        self.durations = {r["number"]: r["seconds"] for r in tests}
         self.deps = Dependencies()
         self.observations = Observations()
         self.imports = load_map(Path(__file__).parent / "maps/imports.json.gz")
@@ -71,21 +74,34 @@ class Selector:
             initializers = ()
             if not hits and not impact.global_change:
                 initializers = self.deps.import_initializers(path, impact.lines)
+            registry = registry_users(patch, source, self.deps)
             if impact.global_change:
-                users = select_config(patch, impact, source, self.deps)
+                users = numeric_users(patch, source, self.deps)
+                if users is None:
+                    users = select_config(patch, impact, source, self.deps)
                 # A fully resolved class assignment runs at import. The per-test
                 # dependency is at the consumer, not at the assignment line.
-                hits = self.global_users(path) if users is None else users
+                if registry is not None:
+                    hits = registry if users is None else registry.intersection(users)
+                else:
+                    hits = self.global_users(path) if users is None else users
+            elif registry is not None:
+                hits = registry
             elif impact.expressions:
                 groups = [self.observations.affected(path, old, new) for old, new in impact.expressions]
                 if all(group is not None for group in groups):
                     hits = set().union(*groups, hits & self.observations.incomplete)
             for owner in initializers:
                 hits.update(self.import_users(owner))
-            return hits | set(self.deps.source_readers(path)) | (self.all - self.deps.tests)
+            hits = (hits | set(self.deps.source_readers(path)) | (self.all - self.deps.tests)) & self.all
+            return hits
         if path in {"pyproject.toml", "setup.cfg", "conftest.py", "tests/conftest.py"}:
             return self.all
         return self.deps.fixture(path)
+
+    def cost(self, nodes):
+        workers = schedule(self.inventory[t] for t in nodes)
+        return 2 * len(workers) + max((sum(self.durations[t] for t in w) for w in workers), default=0)
 
     def import_users(self, path):
         importers = {path, *self.imports["readers"].get(path, ()), *self.imports["unknown"]}

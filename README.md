@@ -2,7 +2,7 @@
 
 A C++17 implementation of the Builders Buildathon Shopping Sessions v5 rules. The executable reads the mounted CSV files and writes `user_daily/` and `campaign_daily/` in Parquet format. It accepts `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`, or input and output directories as positional arguments. Use a dedicated output directory.
 
-The default executable chooses between two exact event readers using the total size of the event CSVs. On the local eight-worker configuration, it chose ordered reads for the 20M-event input and streaming for the 60M-event input. [Measured runtimes, correctness and reproduction commands](BENCHMARK.md)
+The default executable scored **2.1078 seconds** on the organizer’s hidden practice input. It chooses between two exact event readers using the total size of the event CSVs. On the local eight-worker configuration, it chose ordered reads for the 20M-event input and streaming for the 60M-event input. [Measured runtimes, correctness and reproduction commands](BENCHMARK.md)
 
 ## Build and run the scoring image
 
@@ -67,7 +67,7 @@ The benchmark uses an external monotonic clock around each fresh process and a f
 ## Implementation
 
 - Link components use the bytewise smallest member as the person's ID, including aliases that appear only in the link files.
-- The ordered reader maps the CSVs and indexes event IDs while a separate task loads identity links and clicks. It revisits possible duplicates in file order. Its mapping budget is 256 MiB per worker, capped at one third of the memory advertised by `MEM_GB` when set. The streaming reader handles larger inputs. Set `SHOP_READER=ordered` or `SHOP_READER=stream` to benchmark either reader directly.
+- The ordered reader maps the CSVs and indexes event IDs while a separate task loads identity links and clicks. It uses a bitmap to screen for repeated fingerprints, packs common row locations into four bytes, and revisits possible duplicates in file order for an exact ID comparison. Its mapping budget is 256 MiB per worker, capped at one third of the memory advertised by `MEM_GB` when set. The streaming reader handles larger inputs. Set `SHOP_READER=ordered` or `SHOP_READER=stream` to benchmark either reader directly.
 - The streaming reader loads 1 MiB chunks and finishes each owned record across chunk boundaries. It scans 64-byte blocks for commas, quotes and newlines. A two-bit counter identifies event IDs that can be accepted as unique. All possible duplicates go through exact comparison, and the earliest ingested copy wins even when its payload is invalid.
 - In the streaming reader, event IDs up to eight bytes store their length and raw bytes directly. Nine-byte ASCII IDs pack losslessly into 63 bits. Longer or non-ASCII nine-byte IDs retain their original bytes in partition-local storage.
 - Per-person time ordering determines session starts. Equal-time clicks use bytewise click-ID order. For assists, each campaign gets credit for the union of sessions covered by its clicks, including campaigns that never win a session.

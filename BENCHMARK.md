@@ -4,7 +4,7 @@ In the local Linux AMD64 VM, the adaptive image at `65ee24e` recorded median run
 
 ## Official practice submission
 
-The organizer recorded **2.2478 seconds** for `65ee24e` on the hidden practice dataset. At 05:38 EST on November 22, 2026, the leaderboard lead was 0.4218 seconds. [Submitted commit](https://github.com/Naees/rwx-blast-radius/commit/65ee24ef340c216eed66a79a3a6044a530cfcd02) · [Official track and leaderboard](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+The sparse duplicate index at `e83d76d` scored **2.1078 seconds** on the hidden practice dataset at 05:50 EST on November 22, 2026. It reduced the first submission’s **2.2478 seconds** by 0.1400 seconds (6.2%). The leaderboard lead was 0.4218 seconds at the time of the first submission. [Faster submission](https://github.com/Naees/rwx-blast-radius/commit/e83d76db348d9af3b997403ec0d1faddb7938b0a) · [First submission](https://github.com/Naees/rwx-blast-radius/commit/65ee24ef340c216eed66a79a3a6044a530cfcd02) · [Official track and leaderboard](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
 
 ## Selected image in the local VM
 
@@ -21,6 +21,23 @@ Times are seconds from Docker’s recorded container start to exit. Each round u
 With eight workers and a 7 GiB memory limit, the adaptive image used a 2 GiB event-CSV threshold. Stage logs confirmed ordered reads for the 1.61 GiB practice input and streaming reads for the 4.84 GiB final-size input. The threshold was tuned on those two workloads. Compare controls within the same series because VM memory pressure and filesystem cache residency varied across tests.
 
 The containers used eight pinned guest CPUs, UID 1000, a read-only root, a 64 MiB temporary filesystem, disabled networking and a 7 GiB memory limit with swap disabled. The organizer scores hidden datasets on native Linux AMD64 with eight vCPUs and 24 GB of memory. [Official track and scoring rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+## Practice experiments after the first submission
+
+Both series used the same 20M-event, 5M-click input (seed 734) and the same eight-CPU, 7 GiB local VM configuration. Each cell shows the median of three interleaved runs in seconds, followed by the minimum and maximum.
+
+| Image | Series 1 (s) | Series 2 (s) |
+| --- | ---: | ---: |
+| Adaptive baseline, `65ee24e` | 11.674 (9.834–12.793) | 5.403 (5.387–12.175) |
+| Sparse duplicate screening, `e83d76d` | 7.502 (5.639–11.111) | 4.760 (4.645–5.812) |
+| Parquet encoding changes, `a4537d2` | 7.445 (6.868–13.478) | — |
+| Both changes, `f02307c` | — | 6.797 (5.884–9.683) |
+
+The sparse reader packs common row locations and checks full event IDs for possible duplicates. It finished ahead of the adaptive baseline in all six paired rounds, by 7.153, 2.333, 0.563 seconds in series 1 and 6.363, 0.758, 0.627 seconds in series 2. The encoding change retained Snappy compression, skipped Parquet statistics and disabled dictionaries for the user table’s `user_id` and `revenue_cents` columns. The unchanged baseline’s median moved from 11.674 to 5.403 seconds between series, consistent with the variability seen in earlier local measurements.
+
+All 18 runs exited successfully and matched the independent DuckDB reference across 2,261,065 user-day rows and 28,014 campaign-day rows, including schema and duplicate checks. The raw reports are `docker-benchmark-oke_x_4e/results.json` and `docker-benchmark-8yobauf8/results.json` under `.local/`.
+
+The sparse-index image also completed a fresh 60M-event, 15M-click run in **49.505 seconds** on this VM. It selected the streaming reader and matched all 6,640,626 user-day and 28,014 campaign-day rows. This was a single timing with no paired control. Its JSON report is `.local/docker-benchmark-p4uwzjbf/results.json`.
 
 ## Reader experiments
 

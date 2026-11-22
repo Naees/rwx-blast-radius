@@ -39,6 +39,8 @@ All 18 runs exited successfully and matched the independent DuckDB reference acr
 
 The sparse-index image also completed a fresh 60M-event, 15M-click run in **49.505 seconds** on this VM. It selected the streaming reader and matched all 6,640,626 user-day and 28,014 campaign-day rows. This was a single timing with no paired control. Its JSON report is `.local/docker-benchmark-p4uwzjbf/results.json`.
 
+A further prototype kept only the byte offsets of rejected duplicates and scanned line endings again during consumption. Across six interleaved, single-threaded 1M-event trials on native ARM64, it reduced retained row metadata from 9,124,264 to 430,492 bytes. Median CPU time for indexing and consuming events rose from 141.47 to 156.27 ms. The prototype passed all 36 fixtures, 96 randomized cases and the dev answer. The submitted revision keeps the faster row index.
+
 ## Reader experiments
 
 Each cell gives the median wall time in seconds, with the observed minimum and maximum in parentheses. The control in every row is the previous default at `10ab206`.

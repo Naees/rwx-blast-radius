@@ -117,10 +117,35 @@ struct Chunk {
     }
 };
 
-struct Key {
-    uint32_t hash;
-    uint32_t chunk;
-    uint32_t row;
+struct CandidateKeys {
+    struct Packed {
+        uint32_t hash, location;
+    };
+    struct Wide {
+        uint32_t hash, chunk, row;
+    };
+    std::vector<Packed> packed;
+    std::vector<Wide> wide;
+
+    void add(uint32_t hash, uint32_t chunk, uint32_t row) {
+        if (chunk <= UINT16_MAX && row <= UINT16_MAX) {
+            packed.push_back({hash, (chunk << 16) | row});
+        } else {
+            wide.push_back({hash, chunk, row});
+        }
+    }
+
+    template<class Function>
+    void each(Function visit) const {
+        for (const auto& item : packed)
+            visit(item.hash, item.location >> 16, item.location & UINT16_MAX);
+        for (const auto& item : wide)
+            visit(item.hash, item.chunk, item.row);
+    }
+};
+
+struct ScreenWord {
+    uint64_t seen = 0, repeated = 0;
 };
 
 struct IngestDates {
@@ -203,7 +228,7 @@ OrderedEvents::OrderedEvents(const std::filesystem::path& data_dir, size_t worke
     nthreads = std::min(nthreads, chunks.size());
     std::size_t bucket_count = 1;
     while (bucket_count < 1024 && bucket_count * (2U << 20) < total_bytes) bucket_count *= 2;
-    using Buckets = std::vector<std::vector<Key>>;
+    using Buckets = std::vector<CandidateKeys>;
     std::vector<Buckets> keys(nthreads, Buckets(bucket_count));
     run_jobs(nthreads, chunks.size(), [&](std::size_t worker, std::size_t i) {
         auto& chunk = chunks[i];
@@ -223,8 +248,8 @@ OrderedEvents::OrderedEvents(const std::filesystem::path& data_dir, size_t worke
             if (!id.empty()) {
                 const auto hash = key_hash(id);
                 auto& bucket = keys[worker][hash & (bucket_count - 1)];
-                bucket.push_back({static_cast<uint32_t>(hash >> 32), static_cast<uint32_t>(i),
-                                  static_cast<uint32_t>(chunk.rows.size())});
+                bucket.add(static_cast<uint32_t>(hash >> 32), static_cast<uint32_t>(i),
+                           static_cast<uint32_t>(chunk.rows.size()));
                 chunk.rows.push_back({static_cast<uint32_t>(p - chunk.data),
                                       static_cast<uint32_t>(std::min<std::size_t>(len, UINT32_MAX))});
             }
@@ -248,34 +273,59 @@ OrderedEvents::OrderedEvents(const std::filesystem::path& data_dir, size_t worke
     };
     std::vector<Collisions> collisions(bucket_count);
     run_jobs(nthreads, bucket_count, [&](std::size_t, std::size_t bucket) {
-        std::size_t count = 0;
-        for (auto& worker : keys) count += worker[bucket].size();
+        size_t count = 0;
+        for (const auto& worker : keys) count += worker[bucket].packed.size() + worker[bucket].wide.size();
         if (count < 2) return;
-        std::size_t capacity = 4;
-        while (capacity < count + count / 3) capacity *= 2;
-        struct Slot { const Key* first = nullptr; uint32_t group = UINT32_MAX; };
+
+        // Count every row whose bin is occupied at least twice. Unique bins
+        // cannot contain duplicate IDs. Colliding bins still compare full hashes below.
+        size_t word_count = 1;
+        while (word_count < (count + 7) / 8) word_count *= 2;
+        std::vector<ScreenWord> screen(word_count);
+        size_t candidates = 0;
+        for (const auto& worker : keys) {
+            worker[bucket].each([&](uint32_t hash, uint32_t, uint32_t) {
+                auto& word = screen[(hash >> 6) & (word_count - 1)];
+                const uint64_t bit = uint64_t{1} << (hash & 63);
+                const uint64_t previous = word.seen & bit;
+                candidates += (previous != 0) + ((previous & ~word.repeated) != 0);
+                word.repeated |= previous;
+                word.seen |= bit;
+            });
+        }
+        if (!candidates) return;
+        size_t capacity = 4;
+        while (capacity < candidates + candidates / 3) capacity *= 2;
+        struct Slot {
+            uint32_t hash = 0, chunk = 0, row = UINT32_MAX, group = UINT32_MAX;
+        };
         std::vector<Slot> slots(capacity);
         auto& out = collisions[bucket];
-        auto add = [&](const Key& k, uint32_t group) {
+        auto add = [&](uint32_t chunk, uint32_t row, uint32_t group) {
             out.hits.emplace_back();
             auto& hit = out.hits.back();
-            hit.chunk = k.chunk;
-            hit.row = k.row;
+            hit.chunk = chunk;
+            hit.row = row;
             hit.group = group;
         };
-        for (auto& worker : keys) {
-            for (const auto& candidate : worker[bucket]) {
-                std::size_t slot = candidate.hash & (capacity - 1);
-                while (slots[slot].first && slots[slot].first->hash != candidate.hash)
+        for (const auto& worker : keys) {
+            worker[bucket].each([&](uint32_t hash, uint32_t chunk, uint32_t row) {
+                const auto& word = screen[(hash >> 6) & (word_count - 1)];
+                if (!(word.repeated & (uint64_t{1} << (hash & 63)))) return;
+                size_t slot = hash & (capacity - 1);
+                while (slots[slot].row != none && slots[slot].hash != hash)
                     slot = (slot + 1) & (capacity - 1);
                 auto& entry = slots[slot];
-                if (!entry.first) { entry.first = &candidate; continue; }
+                if (entry.row == none) {
+                    entry = {hash, chunk, row, none};
+                    return;
+                }
                 if (entry.group == none) {
                     entry.group = out.groups++;
-                    add(*entry.first, entry.group);
+                    add(entry.chunk, entry.row, entry.group);
                 }
-                add(candidate, entry.group);
-            }
+                add(chunk, row, entry.group);
+            });
         }
     });
     keys.clear();

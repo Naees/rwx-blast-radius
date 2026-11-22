@@ -26,7 +26,9 @@ class TestCompound(unittest.TestCase):
         source = "value = 1\n"
         self.selector.source = Mock(return_value=source)
         comment = change("sqlglot/example.py", source, source + "# note\n")
-        self.assertEqual(self.selector.predict(comment + self.fixture), {"raw", "fixture"})
+        with patch("verification.refine_many", return_value=set()) as replay:
+            self.assertEqual(self.selector.predict(comment + self.fixture), {"raw", "fixture"})
+        self.assertEqual({p.path for p in replay.call_args.args[0]}, {"sqlglot/example.py", "tests/fixtures/example.sql"})
         calls = self.selector.candidates.call_args_list
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].kwargs["fixture_batch"])

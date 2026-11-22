@@ -20,6 +20,9 @@ class Coverage:
     def import_initializers(self, path, lines):
         return self.initializers.intersection(lines)
 
+    def source_readers(self, path):
+        return ()
+
 
 class TestDefaultArguments(unittest.TestCase):
     def select(self, old, new, deps, consumers=""):
@@ -49,9 +52,22 @@ class TestDefaultArguments(unittest.TestCase):
             self.select(old, old.replace("-1", "-2"), deps),
             {"positional", "omitted", "unmeasured"},
         )
+
         self.assertEqual(
             self.select(old, old.replace("'on'", "'off'"), deps),
             {"positional", "omitted", "unmeasured"},
+        )
+
+    def test_early_equivalence_keeps_signed_zeros_distinct(self):
+        old = "def read(number=32):\n    return number\n"
+        self.assertEqual(
+            self.select(old, old.replace("32", "0x20"), Coverage({2: {"reader"}})),
+            set(),
+        )
+        old = old.replace("32", "0.0")
+        self.assertEqual(
+            self.select(old, old.replace("0.0", "-0.0"), Coverage({2: {"reader"}})),
+            {"reader"},
         )
 
     def test_ambiguous_signatures_and_unobserved_bodies_fall_back(self):
@@ -84,6 +100,7 @@ class TestDefaultArguments(unittest.TestCase):
                     old, old.replace("True", "False"), Coverage({2: {"reader"}}), extra
                 )
             )
+
         for prefix in ["@decorator\n", "def make():\n    "]:
             source = (
                 prefix + old
@@ -95,6 +112,53 @@ class TestDefaultArguments(unittest.TestCase):
                     source, source.replace("True", "False"), Coverage({3: {"reader"}})
                 )
             )
+
+    def test_unused_method_default_handles_unrelated_local_with_same_name(self):
+        old = "class Stub:\n    def order(self, reverse=False):\n        raise NotImplementedError\n"
+        local = "def label():\n    order = 1\n    return order\n"
+        self.assertEqual(
+            self.select(old, old.replace("False", "True"), Coverage({}), local), set()
+        )
+        for extra in [
+            "callback = Stub.order\n",
+            "callback = vars(Stub)['order']\n",
+            "callback = Stub.__dict__.get('order')\n",
+            "def inspect_error(exc):\n    return exc.__traceback__.tb_frame.f_locals\n",
+            "NotImplementedError = custom_exception\n",
+        ]:
+            self.assertIsNone(
+                self.select(old, old.replace("False", "True"), Coverage({}), extra)
+            )
+
+    def test_decorator_is_proven_identity(self):
+        cls = "@mark\nclass Stub:\n    def score(self, flag=False):\n        return 1\n"
+        for body, expected in [
+            ("return cls", set()),
+            ("return inspect_and_copy(cls)", None),
+        ]:
+            old = f"def mark(cls):\n    {body}\n\n{cls}"
+            self.assertEqual(
+                self.select(old, old.replace("False", "True"), Coverage({})), expected
+            )
+
+    def test_early_rule_rejects_edited_body_and_observable_calls(self):
+        old = (
+            "class Stub:\n    def order(self, reverse=False):\n        return vars()\n"
+        )
+        changed = old.replace("False", "True")
+        self.assertIsNone(self.select(old, changed, Coverage({})))
+        self.assertIsNone(
+            self.select(
+                old, changed.replace("vars()", "None"), Coverage({3: {"caller"}})
+            )
+        )
+        self.assertIsNone(
+            self.select(
+                old,
+                old.replace("False", "False, other=True"),
+                Coverage({3: {"caller"}}),
+            )
+        )
 
 
 if __name__ == "__main__":

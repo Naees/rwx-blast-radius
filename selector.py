@@ -9,6 +9,7 @@ from pathlib import Path
 from bool_values import affected as boolean_users
 from class_checks import select as class_check_users
 from configmap import select as select_config
+from config_truth import select as config_truth_users
 from default_args import select as default_users
 from deps import Dependencies
 from fixture_usage import select as fixture_users
@@ -72,9 +73,21 @@ class Selector:
             return selected
         if path.endswith(".py") and path.startswith("sqlglot/"):
             source = self.source(patch.old_path) if patch.old_path else ""
+            defaults = default_users(patch, source, self.base, self.deps)
+            if defaults is not None:
+                measured = (defaults | (self.all - self.deps.tests)) & self.all
+                if not allow_probe or all(self.inventory[n]["seconds"] <= 1.5 for n in measured):
+                    if allow_probe and measured:
+                        import verification
+                        measured -= verification.refine_many([patch], measured, self)
+                    return measured
             impact = analyze_python(patch, source)
             if impact.equivalent:
-                return set(self.deps.source_readers(path))
+                readers = set(self.deps.source_readers(path)) & self.all
+                if allow_probe and readers:
+                    import verification
+                    readers -= verification.refine_many([patch], readers, self)
+                return readers
             if patch.old_path != patch.new_path:
                 return self.all
             if impact.invalid:
@@ -89,13 +102,17 @@ class Selector:
                 if users is None:
                     users = select_config(patch, impact, source, self.deps)
                 if users is None:
-                    users = default_users(patch, source, self.base, self.deps)
+                    users = defaults
                 # A fully resolved class assignment runs at import. The per-test
                 # dependency is at the consumer, not at the assignment line.
                 if registry is not None:
                     hits = registry if users is None else registry.intersection(users)
                 else:
                     hits = self.global_users(path) if users is None else users
+                if allow_probe:
+                    checked = config_truth_users(patch, impact, source, self.deps, hits)
+                    if checked is not None:
+                        hits = checked
             elif registry is not None:
                 hits = registry
             elif impact.expressions:
@@ -169,6 +186,7 @@ class Selector:
         patches = parse_patch(text)
         if not patches:
             return self.all
+        original = patches
         raw_readers = set()
         if len(patches) > 1 and len({p.path for p in patches}) == len(patches):
             active = []
@@ -186,7 +204,11 @@ class Selector:
         if len(patches) > 1 and hits:
             import verification
             hits -= verification.refine_many(patches, hits, self)
-        return hits | (raw_readers & self.all)
+        raw_readers.intersection_update(self.all)
+        if raw_readers:
+            import verification
+            raw_readers -= verification.refine_many(original, raw_readers, self)
+        return hits | raw_readers
 
 
 def main():

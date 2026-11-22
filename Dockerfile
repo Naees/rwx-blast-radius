@@ -9,7 +9,7 @@ COPY --from=source /sqlglot/sqlglot /sqlglot/sqlglot
 COPY --from=source /sqlglot/tests /sqlglot/tests
 RUN python -m compileall -q /sqlglot
 WORKDIR /app
-COPY selector.py deps.py impact.py fixtures.py configmap.py observations.py mapdata.py numeric.py registries.py literal_values.py bool_values.py class_checks.py default_args.py assertion_replay.py query_checks.py verification.py stress.py optimizer_replay.py executor_queries.py fixture_usage.py config_sites.py patchrun.py ./
+COPY selector.py deps.py impact.py fixtures.py configmap.py observations.py mapdata.py numeric.py registries.py literal_values.py bool_values.py class_checks.py default_args.py assertion_replay.py query_checks.py verification.py stress.py optimizer_replay.py executor_queries.py fixture_usage.py config_sites.py config_truth.py patchrun.py ./
 COPY maps/ ./maps/
 RUN python mapdata.py && python -m compileall -q /app
 CMD ["python", "selector.py"]

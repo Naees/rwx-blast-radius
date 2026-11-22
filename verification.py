@@ -85,11 +85,16 @@ def _verify(patches, impact, candidates, selector):
         return -sum(costs[n] for n in names) / (.04 + sum(runtime[n] for n in names))
     nodes = [n for group in sorted(groups, key=lambda g: (priority(groups[g]), g))
              for n in sorted(groups[group], key=lambda n: (priority([n]), n))]
+    fixed = candidates - eligible
+    # Once a failing method already pins the worker load, further passing
+    # methods can offer very little. Only calculate this for small batches.
+    decisive = [n for n in nodes if full - selector.cost(fixed | {n}) <= .25] if len(nodes) <= 20 else []
     payload = {
         "nodes": nodes,
         "assertions": {n: assertions[n] for n in nodes if assertions.get(n)},
         "fixtures": {n: fixtures[n] for n in nodes if fixtures.get(n)},
         "stop_early": len(nodes) <= 8 and sum(costs[n] for n in nodes) < .4,
+        "decisive": decisive,
         "cpu_budget": probe_budget(eligible),
     }
     changed = {p.path: p.apply(selector.source(p.path)) for p in patches}

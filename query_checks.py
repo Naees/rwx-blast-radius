@@ -109,16 +109,19 @@ def handle(payload):
 
         def startTest(self, case):
             self.active = by_id.get(case.id())
+            self.failfast = payload["stop_early"] or self.active in decisive
             super().startTest(case)
 
         def stopTest(self, case):
             self.active = None
+            self.failfast = payload["stop_early"]
             super().stopTest(case)
 
         def addSuccess(self, case):
             self.passed.add(by_id[case.id()])
 
     by_id = {case.id(): name for name, case in cases.items()}
+    decisive = set(payload.get("decisive", ()))
     result = Result()
     optimizers = [case for name, case in cases.items() if name.startswith("tests/test_optimizer.py::")]
     if optimizers:

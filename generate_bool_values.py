@@ -17,17 +17,30 @@ import pytest
 from bool_values import location, tree
 from generate_map import PINNED, Recorder, TracedPool
 from observe_base import ProbeFinder
+from slot_facts import SlotFacts
 
 
 UNKNOWN = object()
-SCALARS = {id(cls) for cls in (type(None), bool, int, float, str, bytes)}
-LEN_TYPES = {id(cls) for cls in (list, tuple, dict, str, bytes)}
-SIZED = {id(cls) for cls in (list, tuple, dict, str, bytes, set, frozenset, range)}
+SLOTS = SlotFacts()
+SCALARS = frozenset((type(None), bool, int, float, str, bytes))
+LEN_TYPES = frozenset((list, tuple, dict, str, bytes))
+SIZED = frozenset((list, tuple, dict, str, bytes, set, frozenset, range))
+TRUTH_TYPES = SCALARS | SIZED
 CMP = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt, ast.LtE: operator.le,
        ast.Gt: operator.gt, ast.GtE: operator.ge, ast.Is: operator.is_, ast.IsNot: operator.is_not}
-MRO = type.__dict__["__mro__"]
-NAMESPACE = type.__dict__["__dict__"]
 NATIVE_LEN = len
+
+
+def exact(value, allowed_types):
+    cls = type(value)
+    return type(cls) is type and cls in allowed_types
+
+
+def slot_value(value):
+    cls = type(value)
+    if type(cls) is type and cls in TRUTH_TYPES:
+        return value
+    return value if type(cls) is type and cls in SLOTS.classes else UNKNOWN
 
 
 @lru_cache(maxsize=None)
@@ -39,21 +52,21 @@ def truth(value):
     if value is UNKNOWN:
         return UNKNOWN
     cls = type(value)
-    if id(cls) in SCALARS or id(cls) in SIZED:
+    if type(cls) is type and cls in TRUTH_TYPES:
         return bool(value)
     # Python's default truth value is true in the absence of both slots.
     # Inspect the class namespaces without fetching or calling any descriptors.
-    for typ in MRO.__get__(cls):
-        ns = NAMESPACE.__get__(typ)
-        if "__bool__" in ns or "__len__" in ns:
-            return UNKNOWN
-    return True
+    return True if SLOTS.default_truth(cls) else UNKNOWN
 
 
 def compile_operand(n):
+    if isinstance(n, ast.Attribute) and n.attr in SLOTS.names:
+        owner = compile_operand(n.value)
+        if owner:
+            return lambda local, builtin_len: slot_value(SLOTS.read(owner(local, builtin_len), n.attr, UNKNOWN))
     if isinstance(n, ast.Name):
         return lambda local, builtin_len: local.get(n.id, UNKNOWN)
-    if isinstance(n, ast.Constant) and id(type(n.value)) in SCALARS:
+    if isinstance(n, ast.Constant) and exact(n.value, SCALARS):
         return lambda local, builtin_len: n.value
     if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
         operand = compile_operand(n.operand)
@@ -68,24 +81,26 @@ def compile_operand(n):
             if operand:
                 def length(local, builtin_len):
                     v = operand(local, builtin_len)
-                    return NATIVE_LEN(v) if builtin_len and id(type(v)) in LEN_TYPES else UNKNOWN
+                    return NATIVE_LEN(v) if builtin_len and exact(v, LEN_TYPES) else UNKNOWN
                 return length
         if isinstance(n.func, ast.Attribute) and n.func.attr == "get" and 1 <= len(n.args) <= 2:
             container = compile_operand(n.func.value)
             args = [compile_operand(x) for x in n.args]
             if container and all(args):
+                from_slots = any(isinstance(part, ast.Attribute) and part.attr in SLOTS.names for part in ast.walk(n))
                 def lookup(local, builtin_len):
                     d = container(local, builtin_len)
                     if type(d) is not dict or len(d) > 32:
                         return UNKNOWN
                     key = args[0](local, builtin_len)
                     default = args[1](local, builtin_len) if len(args) == 2 else None
-                    if default is UNKNOWN or id(type(key)) not in SCALARS:
+                    if default is UNKNOWN or not exact(key, SCALARS):
                         return UNKNOWN
                     # Custom keys could run __eq__ on a hash collision.
-                    if any(id(type(k)) not in SCALARS for k in d):
+                    if any(not exact(k, SCALARS) for k in d):
                         return UNKNOWN
-                    return dict.get(d, key, default)
+                    value = dict.get(d, key, default)
+                    return slot_value(value) if from_slots else value
                 return lookup
     if isinstance(n, ast.Compare) and len(n.ops) == 1 and type(n.ops[0]) in CMP:
         left, right = compile_operand(n.left), compile_operand(n.comparators[0])
@@ -104,7 +119,7 @@ def compile_operand(n):
                     return UNKNOWN
                 if op in (ast.Is, ast.IsNot):
                     return CMP[op](a, b)
-                if id(type(a)) in SCALARS and id(type(b)) in SCALARS:
+                if exact(a, SCALARS) and exact(b, SCALARS):
                     try:
                         return CMP[op](a, b)
                     except TypeError:
@@ -238,6 +253,7 @@ class Loader(importlib.abc.Loader):
         tree = transformer.visit(ast.parse(Path(self.origin).read_bytes(), self.origin))
         module._br_bool_probes = transformer.probes
         exec(compile(ast.fix_missing_locations(tree), self.origin, "exec"), module.__dict__)
+        SLOTS.register(module)
 
 
 def main():
@@ -245,6 +261,9 @@ def main():
     revision = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
     if revision != PINNED or subprocess.run(["git", "-C", root, "diff", "--quiet", "HEAD"]).returncode:
         raise ValueError("Expected a clean pinned checkout")
+    for path in (root / "sqlglot").rglob("*.py"):
+        name = path.relative_to(root).with_suffix("").as_posix().replace("/", ".").removesuffix(".__init__")
+        SLOTS.add_module(name, ast.parse(path.read_bytes(), str(path)))
     tests = sorted(t["id"] for t in json.loads(inventory.read_bytes())["tests"])
     recorder = BoolRecorder(root, tests)
     os.chdir(root)

@@ -10,6 +10,7 @@ from bool_values import affected as boolean_users
 from class_checks import select as class_check_users
 from configmap import select as select_config
 from config_truth import select as config_truth_users
+from container_refactors import equivalent as equivalent_containers
 from default_args import select as default_users
 from deps import Dependencies
 from fixture_usage import select as fixture_users
@@ -83,8 +84,10 @@ class Selector:
                         measured -= verification.refine_many([patch], measured, self)
                     return measured
             impact = analyze_python(patch, source)
-            if impact.equivalent:
+            if impact.equivalent or (allow_probe and not impact.invalid and equivalent_containers(patch, source)):
                 readers = set(self.deps.source_readers(path)) & self.all
+                if not impact.equivalent:
+                    readers.update(self.all - self.deps.tests)
                 if allow_probe and readers:
                     import verification
                     readers -= verification.refine_many([patch], readers, self)
@@ -142,6 +145,10 @@ class Selector:
                 import stress
                 import verification
                 if not initializers:
+                    from call_binding import select as call_users
+                    bound = call_users(patch, source, self.deps, hits)
+                    if bound is not None:
+                        hits = (bound & self.all) | (self.all - self.deps.tests)
                     hits -= optimizer_replay.refine(patch, impact, hits, self.base, self.cost)
                     hits -= executor_queries.refine(patch, impact, hits, self.base, self.cost)
                 hits -= verification.refine(patch, impact, hits, self)

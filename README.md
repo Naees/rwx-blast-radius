@@ -21,6 +21,10 @@ For edits to an `isinstance` check, the selector compares the old and new class 
 
 An integer index edit can leave a test unaffected when both indices refer to the same object in every observed list or tuple. A changed default can likewise leave a caller unaffected if it supplied an explicit argument. For expensive TPC tests, the selector also checks observed function signatures and object types before replaying optimizer stages.
 
+For a single-file edit, the selector can recognize equivalent emptiness checks on local containers created by literals or comprehensions. It also recognizes an in-place reversal of an exact list expressed through slice assignment. These checks inspect other assignments to the local and preserve tests that read the source itself.
+
+The Boolean profiler can read a declared Python slot when it verifies the receiver class and the slot descriptor. For a direct call changed from positional to keyword arguments, the selector checks the callee, parameter binding and evaluation order. It retains tests that may replace the callable, inspect its code or run it in another process.
+
 The selector can run candidate tests in a temporary checkout containing the patch. For a single-file source edit it uses baseline coverage to narrow independent SQL fixture rows and dialect assertions. For selected expensive tests it can replay optimizer stages, compare the resulting trees with the baseline, or run individual executor queries against DuckDB. For edits to fixture data it distinguishes the input SQL, expected SQL and metadata a test consumed. Probe failures and timeouts leave unverified tests in the schedule.
 
 The prediction is empirical. New control flow, dynamic imports and differences between profiling and scoring environments can affect recall. The organizer's sample answers are used only by the external scorer.
@@ -49,6 +53,7 @@ python generate_stress.py "$BASE" maps/stress.json.gz
 python generate_numeric.py "$BASE" "$TESTS" maps/numeric.json.gz
 python generate_literal_values.py "$BASE" "$TESTS" maps/literal_values.json.gz
 python generate_bool_values.py "$BASE" "$TESTS" maps/bool_values.json.gz
+python generate_call_binding.py "$BASE" maps/call_binding.json.gz
 python generate_config_truth.py "$BASE" "$TESTS" maps/config_truth.json.gz
 python generate_class_checks.py "$BASE" "$TESTS" maps/class_checks.json.gz
 python default_args.py "$BASE" maps/default_args.json.gz

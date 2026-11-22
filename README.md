@@ -1,8 +1,8 @@
 # Shopping Sessions
 
-A local C++17 implementation of the Builders Buildathon Shopping Sessions v5 rules. The executable reads the mounted CSV files and writes `user_daily/` and `campaign_daily/` in Parquet format. It accepts `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`, or input and output directories as positional arguments. Use a dedicated output directory.
+A C++17 implementation of the Builders Buildathon Shopping Sessions v5 rules. The executable reads the mounted CSV files and writes `user_daily/` and `campaign_daily/` in Parquet format. It accepts `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`, or input and output directories as positional arguments. Use a dedicated output directory.
 
-The single-pass event reader is the default after a three-run, 60M-event comparison. The earlier ordered reader remains available at commit `e4b0f95`. [Runtime, correctness results and reproduction commands](BENCHMARK.md)
+The default executable chooses between two exact event readers using the total size of the event CSVs. On the local eight-worker configuration, it chose ordered reads for the 20M-event input and streaming for the 60M-event input. [Measured runtimes, correctness and reproduction commands](BENCHMARK.md)
 
 ## Build and run the scoring image
 
@@ -15,7 +15,7 @@ docker run --rm --platform linux/amd64 --network none --read-only \
   --cpus 8 --memory 24g --memory-swap 24g --pids-limit 4096 \
   --tmpfs /tmp:rw,size=64m,mode=1777 \
   -v "$PWD/.local/dev:/data:ro" -v "$PWD/.local/container-output:/output" \
-  -v "$PWD/.local/scratch:/scratch" -e HOME=/scratch -e NCPU=8 shopping-sessions-local:v5
+  -v "$PWD/.local/scratch:/scratch" -e HOME=/scratch -e NCPU=8 -e MEM_GB=24 shopping-sessions-local:v5
 ```
 
 The image selects AVX2 on compatible x86 processors and ships a portable fallback. Apache Arrow and Parquet C++ come from the pinned PyArrow wheel. Python runs only at build time and in the external test tools.
@@ -67,9 +67,12 @@ The benchmark uses an external monotonic clock around each fresh process and a f
 ## Implementation
 
 - Link components use the bytewise smallest member as the person's ID, including aliases that appear only in the link files.
-- Workers read event CSVs in 1 MiB chunks. Each well-formed row with a nonempty event ID retains its ingestion time, including rows whose event values fail validation. Within each hash partition, exact ID comparison selects the earliest copy. An invalid winner suppresses every later copy.
-- Event IDs up to eight bytes store their length and raw bytes directly. Nine-byte ASCII IDs pack losslessly into 63 bits. Longer or non-ASCII nine-byte IDs retain their original bytes in partition-local storage. Hashes select candidate slots, and equality compares the full ID.
+- The ordered reader maps the CSVs and indexes event IDs while a separate task loads identity links and clicks. It revisits possible duplicates in file order. Its mapping budget is 256 MiB per worker, capped at one third of the memory advertised by `MEM_GB` when set. The streaming reader handles larger inputs. Set `SHOP_READER=ordered` or `SHOP_READER=stream` to benchmark either reader directly.
+- The streaming reader loads 1 MiB chunks and finishes each owned record across chunk boundaries. It scans 64-byte blocks for commas, quotes and newlines. A two-bit counter identifies event IDs that can be accepted as unique. All possible duplicates go through exact comparison, and the earliest ingested copy wins even when its payload is invalid.
+- In the streaming reader, event IDs up to eight bytes store their length and raw bytes directly. Nine-byte ASCII IDs pack losslessly into 63 bits. Longer or non-ASCII nine-byte IDs retain their original bytes in partition-local storage.
 - Per-person time ordering determines session starts. Equal-time clicks use bytewise click-ID order. For assists, each campaign gets credit for the union of sessions covered by its clicks, including campaigns that never win a session.
 - Parallel column writers emit both tables with UTC dates, integer revenue in cents and a nullable top category.
 
 Public engineering write-ups informed the performance experiments. Fraun describes batched identity lookups and separates warm-cache, cold-cache, process and container timings. Kentucky Fried Evan describes compact event records and campaign interval merging. This implementation treats every ID as an opaque string. [Fraun](https://github.com/mliao0128/fraun-shopping-sessions) · [Kentucky Fried Evan](https://github.com/EvanDamron/shopping-sessions)
+
+Team Uhhh published measurements of cache-sized partitions, buffered reads and exact duplicate filtering. Polaris describes resolving identity links while CSV workers scan input. The local experiments with these techniques are recorded in the benchmark report. [Team Uhhh](https://github.com/matthewf725/shopping-sessions#measurements) · [Polaris](https://github.com/enkyuan/polaris#pipeline)

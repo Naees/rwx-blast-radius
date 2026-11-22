@@ -50,15 +50,29 @@ def run_helper(image, cpu, memory, mounts, entrypoint, *args):
 
 
 def verify(db, candidate):
+    integer_types = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+                     "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT"}
+    column_types = {name: {"VARCHAR"} for name in ("user_id", "campaign_id", "channel", "top_category")}
+    column_types["day"] = {"DATE"}
     for table in ("user_daily", "campaign_daily"):
-        files = str(candidate / table / "*.parquet")
+        files = sorted(str(p) for p in (candidate / table).glob("*.parquet")
+                       if p.is_file() and not p.is_symlink() and not p.name.startswith((".", "_")))
+        if not files:
+            raise ValueError(f"{table} has no Parquet parts")
         expected = [col[0] for col in db.execute(f"DESCRIBE {table}").fetchall()]
-        actual = [col[0] for col in db.execute("DESCRIBE SELECT * FROM read_parquet(?)", [files]).fetchall()]
-        if set(actual) != set(expected):
-            raise ValueError(f"{table} has unexpected columns: {actual}")
+        # SQL set operations can coerce a timestamp to a date or a number to
+        # text. Check each part's declared types before comparing row values.
+        for part in files:
+            schema = {row[0]: row[1] for row in db.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)", [part]).fetchall()}
+            if set(schema) != set(expected):
+                raise ValueError(f"{part} has unexpected columns: {list(schema)}")
+            for col, dtype in schema.items():
+                if dtype not in column_types.get(col, integer_types):
+                    raise ValueError(f"{part} has unexpected type {dtype} for {col}")
         columns = ", ".join(f'"{name}"' for name in expected)
         wanted = f"SELECT {columns} FROM {table}"
-        got = f"SELECT {columns} FROM read_parquet(?)"
+        got = f"SELECT {columns} FROM read_parquet(?, union_by_name=true)"
         # EXCEPT ALL compares multiplicity as well as nulls and field values.
         for left, right in ((wanted, got), (got, wanted)):
             if db.execute(f"SELECT 1 FROM ({left} EXCEPT ALL {right}) LIMIT 1", [files]).fetchone():
@@ -66,7 +80,7 @@ def verify(db, candidate):
     return True
 
 
-def comparison(images, data, oracle, result_dir, rounds, requested_cpus, memory_gib):
+def comparison(images, data, oracle, result_dir, rounds, requested_cpus, memory_gib, profile=False):
     info = json.loads(docker("info", "--format", '{"cpus":{{.NCPU}},"bytes":{{.MemTotal}}}'))
     cpu = min(info["cpus"], requested_cpus)
     memory_mib = min(memory_gib * 1024, info["bytes"] // 2**20)
@@ -118,6 +132,7 @@ def comparison(images, data, oracle, result_dir, rounds, requested_cpus, memory_
                                    "-e", f"NCPU={cpu}", "-e", f"MEM_GB={memory_mib // 1024}",
                                    "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output",
                                    "-e", "SCRATCH_DIR=/scratch", "-e", "HOME=/scratch",
+                                   *(["-e", "SHOP_PROFILE=1"] if profile else []),
                                    *input_mount, *writable, resolved[label])
                     try:
                         docker("start", ident)
@@ -128,6 +143,9 @@ def comparison(images, data, oracle, result_dir, rounds, requested_cpus, memory_
                         row = dict(round=round_no, label=label, started=state["StartedAt"],
                                    finished=state["FinishedAt"], seconds=(finished-started).total_seconds(),
                                    exit=state["ExitCode"], oom=state["OOMKilled"], verified=None)
+                        if profile:
+                            logs = subprocess.run(["docker", "logs", ident], text=True, capture_output=True, check=True)
+                            row["profile"] = logs.stderr.strip().splitlines()
                         report["runs"].append(row)
                         save()
                         if row["exit"] or row["oom"]:
@@ -168,6 +186,7 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--memory-gib", type=int, default=24)
+    parser.add_argument("--profile", action="store_true", help="record pipeline stage timings in the JSON report")
     args = parser.parse_args()
     images = {}
     for entry in args.entry:
@@ -183,7 +202,7 @@ def main():
     result_dir = Path(tempfile.mkdtemp(prefix="docker-benchmark-", dir=BASE))
     print(f"Results: {result_dir}", flush=True)
     comparison(images, args.data.resolve(), args.oracle.resolve() if args.oracle else None,
-               result_dir, args.runs, args.cpus, args.memory_gib)
+               result_dir, args.runs, args.cpus, args.memory_gib, args.profile)
 
 
 if __name__ == "__main__":

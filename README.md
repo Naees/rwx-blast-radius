@@ -2,6 +2,8 @@
 
 A local C++17 implementation of the Builders Buildathon Shopping Sessions v5 rules. The executable reads the mounted CSV files and writes `user_daily/` and `campaign_daily/` in Parquet format. It accepts `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`, or input and output directories as positional arguments. Use a dedicated output directory.
 
+The single-pass event reader is the default after a three-run, 60M-event comparison. The earlier ordered reader remains available at commit `e4b0f95`. [Runtime, correctness results and reproduction commands](BENCHMARK.md)
+
 ## Build and run the scoring image
 
 ```sh

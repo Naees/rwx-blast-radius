@@ -94,6 +94,13 @@ def generate(root, seed):
     for suffix in ("1", "2"):
         event(long_prefix + suffix, "nul" + "\x00" * int(suffix), t, price=suffix)
     event(long_prefix + "1", "losing-user", t, ingest=t + 1000)
+    if seed == 0:
+        # The ID ends in the next 1 MiB read chunk. Distinguish the final byte
+        # and ensure an invalid early copy still suppresses its valid duplicate.
+        boundary = "z" * (1024 * 1024 + 13)
+        event(boundary + "a", "chunk-user", "bad", ingest=t)
+        event(boundary + "a", "chunk-user", t, ingest=t + 1000)
+        event(boundary + "b", "chunk-user", t, price="19")
     if end != END:
         event("wide", "fixture-A", end - DAY, "p0", "3")
         event("wide-view", "fixture-B", end - DAY + 1, "p1", "", "view")
@@ -130,7 +137,8 @@ def generate(root, seed):
             (root / table).mkdir()
             parts = [(root / table / f"{i}.csv", rows[i::3] if i < 3 else []) for i in range(4)]
         for file, part in parts:
-            file.write_bytes(("\n".join([header, *part]) + "\n").encode())
+            terminator = "" if seed == 0 and file.name == "1.csv" else "\n"
+            file.write_bytes(("\n".join([header, *part]) + terminator).encode())
 
 
 def rows(root, table):

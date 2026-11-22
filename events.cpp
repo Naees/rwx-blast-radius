@@ -178,41 +178,90 @@ void read_bytes(const File& file, size_t at, size_t n, char* dest) {
     }
 }
 
-// A row belongs to the chunk containing its first byte. Read beyond the nominal
-// boundary to finish that row, even when it spans multiple chunks or ends at EOF.
+// Scan a complete sequence of newline-terminated records in 64-byte groups.
+// Quote totals include every byte, so a quote inside an otherwise unused field
+// still invalidates the row. Only matched quotes on field boundaries are removed.
+template<class Function>
+void parse_records(const char* bytes, size_t size, Function process) {
+    std::array<std::string_view, 7> fields;
+    const char* field = bytes;
+    size_t count = 0, quote_count = 0, paired_quotes = 0;
+    for (size_t offset = 0; offset < size; offset += 64) {
+        size_t width = std::min<size_t>(64, size - offset);
+        const char* block = bytes + offset;
+        uint64_t endings = 0, quotes = 0, lines = 0;
+        size_t i = 0;
+#if defined(__AVX2__) || defined(__SSE2__) || defined(__aarch64__)
+        for (; i + detail::vector_bytes <= width; i += detail::vector_bytes) {
+            uint32_t comma, quote;
+            detail::csv_masks(block + i, comma, quote);
+            auto newline = detail::delimiter_mask(block + i, '\n');
+            endings |= uint64_t(comma | newline) << i;
+            quotes |= uint64_t(quote) << i;
+            lines |= uint64_t(newline) << i;
+        }
+#endif
+        for (; i < width; ++i) {
+            const uint64_t bit = uint64_t{1} << i;
+            if (block[i] == ',' || block[i] == '\n') endings |= bit;
+            if (block[i] == '"') quotes |= bit;
+            if (block[i] == '\n') lines |= bit;
+        }
+        while (endings) {
+            const uint64_t bit = endings & -endings;
+            const char* end = block + __builtin_ctzll(endings);
+            if (count < fields.size()) {
+                const bool wrapped = end - field >= 2 && field[0] == '"' && end[-1] == '"';
+                fields[count] = {field + wrapped, static_cast<size_t>(end - field - 2 * wrapped)};
+                paired_quotes += 2 * wrapped;
+            }
+            ++count;
+            if (lines & bit) {
+                quote_count += __builtin_popcountll(quotes & (bit - 1));
+                quotes &= ~(bit - 1);
+                if (count == fields.size() && quote_count == paired_quotes) process(fields);
+                count = quote_count = paired_quotes = 0;
+            }
+            field = end + 1;
+            endings &= endings - 1;
+        }
+        quote_count += __builtin_popcountll(quotes);
+    }
+}
+
+// A row belongs to the chunk containing its first byte. Extend the last row
+// before parsing so every field view remains stable until the chunk is consumed.
 template<class Function>
 void read_chunk(const File& file, size_t start, std::vector<char>& buffer, Function process) {
-    size_t base = start ? start - 1 : 0;
-    size_t logical_end = std::min(file.bytes, start + input_chunk) - base;
+    const size_t base = start ? start - 1 : 0;
+    const size_t logical_end = std::min(file.bytes, start + input_chunk) - base;
     size_t end = std::min(file.bytes - base, logical_end + 512);
     buffer.resize(end);
     read_bytes(file, base, end, buffer.data());
     size_t pos = start - base;
     if (start == 0 || buffer[pos - 1] != '\n') {
-        const char* nl = static_cast<const char*>(std::memchr(buffer.data() + pos, '\n', logical_end - pos));
+        const auto* nl = static_cast<const char*>(std::memchr(buffer.data() + pos, '\n', logical_end - pos));
         if (!nl) return;
-        pos = nl - buffer.data() + 1;
+        pos = static_cast<size_t>(nl - buffer.data()) + 1;
     }
-    while (pos < logical_end) {
-        size_t look = pos;
-        size_t line_end;
-        for (;;) {
-            const char* nl = static_cast<const char*>(std::memchr(buffer.data() + look, '\n', end - look));
-            if (nl) {
-                line_end = nl - buffer.data();
-                break;
-            }
-            if (end == file.bytes - base) {
-                line_end = end;
-                break;
-            }
-            look = end;
-            end = std::min(file.bytes - base, end + input_chunk);
-            buffer.resize(end);
-            read_bytes(file, base + look, end - look, buffer.data() + look);
+    if (pos >= logical_end) return;
+    size_t look = logical_end - 1;
+    for (;;) {
+        const auto* nl = static_cast<const char*>(std::memchr(buffer.data() + look, '\n', end - look));
+        if (nl) {
+            size_t length = static_cast<size_t>(nl - buffer.data()) + 1 - pos;
+            parse_records(buffer.data() + pos, length, process);
+            return;
         }
-        process(std::string_view(buffer.data() + pos, line_end - pos));
-        pos = line_end + 1;
+        if (end == file.bytes - base) {
+            buffer.push_back('\n');
+            parse_records(buffer.data() + pos, buffer.size() - pos, process);
+            return;
+        }
+        look = end;
+        end = std::min(file.bytes - base, end + input_chunk);
+        buffer.resize(end);
+        read_bytes(file, base + look, end - look, buffer.data() + look);
     }
 }
 
@@ -272,9 +321,8 @@ struct alignas(128) Reader {
     }
 };
 
-void parse_line(const Inputs& inputs, Reader& reader, std::string_view line, size_t buckets) {
-    std::array<std::string_view, 7> f;
-    if (!parse_csv(line, f) || f[0].empty()) return;
+void parse_line(const Inputs& inputs, Reader& reader, const std::array<std::string_view, 7>& f, size_t buckets) {
+    if (f[0].empty()) return;
     const Id id = identify(f[0]);
     auto& part = reader.partitions[(id.hash >> 32) & (buckets - 1)];
     uint64_t key = id.mode ? id.word : part.save_string(f[0], static_cast<uint32_t>(id.hash));
@@ -447,8 +495,8 @@ void read_events(const std::filesystem::path& data_dir, const Inputs& inputs,
     run_jobs(threads, tasks.size(), [&](size_t worker, size_t i) {
         auto& r = readers[worker];
         auto task = tasks[i];
-        read_chunk(files[task.file], task.offset, r.buffer, [&](std::string_view line) {
-            parse_line(inputs, r, line, buckets);
+        read_chunk(files[task.file], task.offset, r.buffer, [&](const auto& fields) {
+            parse_line(inputs, r, fields, buckets);
         });
         r.flush(inputs);
     });

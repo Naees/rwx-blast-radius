@@ -95,7 +95,7 @@ class Selector:
                 return self.import_users(path)
             hits = set().union(*(self.deps.line(path, line) for line in impact.lines))
             initializers = ()
-            if not hits and not impact.global_change:
+            if not impact.global_change:
                 initializers = self.deps.import_initializers(path, impact.lines)
             registry = registry_users(patch, source, self.deps)
             if impact.global_change:
@@ -141,10 +141,12 @@ class Selector:
                 import optimizer_replay
                 import stress
                 import verification
-                hits -= optimizer_replay.refine(patch, impact, hits, self.base, self.cost)
-                hits -= executor_queries.refine(patch, impact, hits, self.base, self.cost)
+                if not initializers:
+                    hits -= optimizer_replay.refine(patch, impact, hits, self.base, self.cost)
+                    hits -= executor_queries.refine(patch, impact, hits, self.base, self.cost)
                 hits -= verification.refine(patch, impact, hits, self)
-                hits -= stress.refine(patch, impact, hits, self.base, self.inventory)
+                if not initializers:
+                    hits -= stress.refine(patch, impact, hits, self.base, self.inventory)
             return hits
         if path in {"pyproject.toml", "setup.cfg", "conftest.py", "tests/conftest.py"}:
             return self.all

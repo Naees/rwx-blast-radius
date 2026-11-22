@@ -209,14 +209,15 @@ class ProbeLoader(importlib.abc.Loader):
 
 
 class ProbeFinder(importlib.abc.MetaPathFinder):
-    def __init__(self, recorder):
+    def __init__(self, recorder, loader=ProbeLoader):
         self.recorder = recorder
+        self.loader = loader
 
     def find_spec(self, fullname, path, target=None):
         if fullname == "sqlglot" or fullname.startswith("sqlglot."):
             spec = importlib.machinery.PathFinder.find_spec(fullname, path)
             if spec and spec.origin and spec.origin.endswith(".py") and self.recorder.relative(spec.origin):
-                spec.loader = ProbeLoader(spec.origin, self.recorder)
+                spec.loader = self.loader(spec.origin, self.recorder)
                 return spec
         return None
 

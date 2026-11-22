@@ -2,6 +2,7 @@
 import argparse
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from statistics import median
 
@@ -35,6 +36,10 @@ def main():
     for name in ["tests.json", "commits"]:
         flags += ["--mount", f"type=bind,source={data/name},target=/data/{name},readonly"]
     totals = []
+    outdir = Path(".work")
+    outdir.mkdir(exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix=f"bench-{data.name}-", dir=outdir))
+    print(f"Predictions saved in {run_dir}", flush=True)
     for i in range(args.runs):
         run = subprocess.run(["docker", "run", *flags, args.image, "python", "-c", TIMER],
                              capture_output=True, timeout=200)
@@ -42,7 +47,7 @@ def main():
         if run.returncode:
             sys.exit(logs)
         cpu = int(logs.rstrip().splitlines()[-1].removeprefix("cpu_us ")) / 1e6
-        path = Path(".work") / f"{data.name}-run-{i+1}.jsonl"
+        path = run_dir / f"run-{i+1}.jsonl"
         path.write_bytes(run.stdout)
         report = subprocess.check_output([sys.executable, str(args.scorer), str(data),
                                           str(data / "answers.json"), str(path),

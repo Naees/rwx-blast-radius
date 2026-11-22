@@ -6,10 +6,13 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
+from bool_values import affected as boolean_users
 from configmap import select as select_config
 from deps import Dependencies
+from fixture_usage import select as fixture_users
 from fixtures import FixtureSelector
 from impact import analyze_python, parse_patch
+from literal_values import affected as literal_users
 from mapdata import load as load_map
 from numeric import select as numeric_users
 from observations import Observations
@@ -51,13 +54,17 @@ class Selector:
             raise ValueError("Patch path outside checkout")
         return p.read_text("utf-8")
 
-    def candidates(self, patch):
+    def candidates(self, patch, allow_probe=False, fixture_batch=False):
         path = patch.path
         for filename in (patch.old_path, patch.new_path):
             if filename and (Path(filename).is_absolute() or ".." in Path(filename).parts):
                 return self.all
         if patch.binary:
             return self.all
+        if allow_probe or fixture_batch:
+            mapped = fixture_users(patch, self.base, self.all, self.deps)
+            if mapped is not None:
+                return mapped
         selected = self.fixtures.select(patch)
         if selected is not None:
             return selected
@@ -88,12 +95,28 @@ class Selector:
             elif registry is not None:
                 hits = registry
             elif impact.expressions:
-                groups = [self.observations.affected(path, old, new) for old, new in impact.expressions]
+                groups = []
+                for old, new in impact.expressions:
+                    group = boolean_users(path, old, new, hits)
+                    if group is None:
+                        group = self.observations.affected(path, old, new)
+                    if group is None:
+                        group = literal_users(path, old, new, hits)
+                    groups.append(group)
                 if all(group is not None for group in groups):
                     hits = set().union(*groups, hits & self.observations.incomplete)
             for owner in initializers:
                 hits.update(self.import_users(owner))
             hits = (hits | set(self.deps.source_readers(path)) | (self.all - self.deps.tests)) & self.all
+            if allow_probe and hits:
+                import executor_queries
+                import optimizer_replay
+                import stress
+                import verification
+                hits -= optimizer_replay.refine(patch, impact, hits, self.base)
+                hits -= executor_queries.refine(patch, impact, hits, self.base, self.cost)
+                hits -= verification.refine(patch, impact, hits, self)
+                hits -= stress.refine(patch, impact, hits, self.base, self.inventory)
             return hits
         if path in {"pyproject.toml", "setup.cfg", "conftest.py", "tests/conftest.py"}:
             return self.all
@@ -129,9 +152,13 @@ class Selector:
         if not patches:
             return self.all
         hits = set()
+        fixture_batch = all(p.path.startswith("tests/fixtures/") for p in patches)
         for patch in patches:
-            hits.update(self.candidates(patch))
+            hits.update(self.candidates(patch, allow_probe=len(patches) == 1, fixture_batch=fixture_batch))
         hits.intersection_update(self.all)
+        if len(patches) > 1 and hits:
+            import verification
+            hits -= verification.refine_many(patches, hits, self)
         return hits
 
 

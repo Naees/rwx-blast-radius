@@ -17,7 +17,7 @@ The dependency maps come from the unmodified SQLGlot revision `eb11aec4be8cb2122
 
 Separate maps track class attributes, registry lookups, fixture reads, Python files read as data, and code reached during imports. The profiler also follows serialized arguments and results at process-pool boundaries. The selector uses the measured test durations to compare one through eight worker schedules, including the two-second cost for each worker.
 
-For dictionary edits the profiler tracks individual key reads, including copies of dialect registries. For integer constants used only in supported branches it records the range within which each test takes the same path.
+The selector can run candidate tests in a temporary checkout containing the patch. For a single-file source edit it uses baseline coverage to narrow independent SQL fixture rows and dialect assertions. For selected expensive tests it can replay optimizer stages, compare the resulting trees with the baseline, or run individual executor queries against DuckDB. For edits to fixture data it distinguishes the input SQL, expected SQL and metadata a test consumed. Probe failures and timeouts leave unverified tests in the schedule.
 
 The prediction is empirical. New control flow, dynamic imports and differences between profiling and scoring environments can affect recall. The organizer's sample answers are used only by the external scorer.
 
@@ -37,11 +37,20 @@ python generate_scopes.py "$BASE" maps/scopes.json.gz
 python generate_imports.py "$BASE" "$TESTS"
 python generate_initializers.py "$BASE" "$TESTS" maps/initializers.json.gz
 python fixtures.py "$BASE"
+python generate_assertions.py "$BASE" "$TESTS" maps/assertions.json.gz
+python generate_queries.py "$BASE" "$TESTS" maps/queries.json.gz
+python generate_fixture_usage.py "$BASE" "$TESTS" maps/fixture_usage.json.gz
+python generate_config_sites.py "$BASE" "$TESTS" maps/config_sites.json.gz
+python generate_stress.py "$BASE" maps/stress.json.gz
 python generate_numeric.py "$BASE" "$TESTS" maps/numeric.json.gz
+python generate_literal_values.py "$BASE" "$TESTS" maps/literal_values.json.gz
+python generate_bool_values.py "$BASE" "$TESTS" maps/bool_values.json.gz
 python generate_registries.py "$BASE" "$TESTS" .work/registry-all.json.gz
 python pack_registries.py "$BASE" maps/registries.json.gz .work/registry-all.json.gz
+python optimizer_replay_build.py "$BASE"
+python executor_queries_build.py "$BASE"
 ```
 
-The submitted image uses the committed maps. Docker fetches the pinned SQLGlot source and compiles the maps into a local cache during the build. Prediction uses the Python standard library.
+The submitted image uses the committed maps. Docker fetches the pinned SQLGlot source, installs dependencies for the runtime probes and compiles the maps into a local cache during the build.
 
 [Competition rules and starter kit](https://www.joinbuilders.org/buildathon/tracks/blast-radius) · [Testmon's explanation of dependency-based test selection](https://www.testmon.org/blog/determining-affected-tests/)

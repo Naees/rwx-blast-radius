@@ -324,21 +324,59 @@ bool earlier(const Partition& current_part, const Candidate& current,
     return current_time < previous_time;
 }
 
-void deduplicate(std::vector<Reader>& readers, size_t bucket, WorkerEvents& output, int64_t window_start) {
-    struct Slot {
-        Candidate* winner = nullptr;
-        uint32_t reader, hash;
-    };
+struct Slot {
+    Candidate* winner = nullptr;
+    uint32_t reader = 0, hash = 0;
+};
+
+struct alignas(128) DedupScratch {
+    std::vector<uint64_t> filter;
+    std::vector<uint32_t> hashes;
+    std::vector<Slot> slots;
+};
+
+void deduplicate(std::vector<Reader>& readers, size_t bucket, WorkerEvents& output,
+                 int64_t window_start, DedupScratch& scratch) {
     size_t count = 0;
     for (const auto& reader : readers) count += reader.partitions[bucket].count;
+    // A two-bit counter saturates on the second observation. A unique
+    // counter proves its only row cannot have a duplicate, even across readers.
+    size_t filter_words = 1;
+    while (filter_words * 32 < count * 8) filter_words *= 2;
+    auto& filter = scratch.filter;
+    auto& hashes = scratch.hashes;
+    filter.assign(filter_words, 0);
+    hashes.clear();
+    hashes.reserve(count);
+    size_t suspects = 0;
+    auto bit = [](uint32_t hash) { return uint64_t{1} << (2 * (hash & 31)); };
+    for (auto& reader : readers) {
+        auto& part = reader.partitions[bucket];
+        part.each([&](const Candidate& row) {
+            const uint32_t hash = part.slot_hash(row);
+            hashes.push_back(hash);
+            const uint64_t mask = bit(hash);
+            auto& word = filter[(hash >> 5) & (filter_words - 1)];
+            if (word & mask) {
+                // The first collision sends both rows to the exact table.
+                suspects += (word & (mask << 1)) ? 1 : 2;
+                word |= mask << 1;
+            } else {
+                word |= mask;
+            }
+        });
+    }
     size_t capacity = 4;
-    while (capacity < count + count / 3) capacity *= 2;
-    std::vector<Slot> slots(capacity);
+    while (capacity < suspects + suspects / 3) capacity *= 2;
+    auto& slots = scratch.slots;
+    slots.assign(capacity, {});
+    size_t ordinal = 0;
     const int64_t ingest_base = window_start / 1000 - INT32_MAX;
     for (uint32_t k = 0; k < readers.size(); ++k) {
         auto& part = readers[k].partitions[bucket];
         part.each([&](Candidate& row) {
-            const uint32_t hash = part.slot_hash(row);
+            const uint32_t hash = hashes[ordinal++];
+            if (!(filter[(hash >> 5) & (filter_words - 1)] & (bit(hash) << 1))) return;
             size_t index = hash & (capacity - 1);
             while (slots[index].winner) {
                 auto& slot = slots[index];
@@ -421,8 +459,9 @@ void read_events(const std::filesystem::path& data_dir, const Inputs& inputs,
         std::vector<char>().swap(r.buffer);
     }
     for (auto& worker : workers) worker.reserve(inputs.person_count(), rows / threads + 1);
+    std::vector<DedupScratch> scratch(threads);
     run_jobs(threads, buckets, [&](size_t worker, size_t bucket) {
-        deduplicate(readers, bucket, workers[worker], inputs.window_start);
+        deduplicate(readers, bucket, workers[worker], inputs.window_start, scratch[worker]);
     });
     checkpoint("stream deduplicate and collect");
 }

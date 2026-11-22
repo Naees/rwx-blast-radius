@@ -89,6 +89,10 @@ def generate(root, seed):
         add("clicks", key, "fixture-B", f"c_{c}", str(when))
     event("duplicate", "fixture-A", "bad", ingest=t)
     event("duplicate", "fixture-B", t, ingest=t + 1000)
+    # These distinct opaque IDs share the same 32-bit in-memory slot hash.
+    event("000073e1", "collision-a", "bad", ingest=t)
+    event("000073e1", "collision-a", t, ingest=t + 1000)
+    event("0001114b", "collision-b", t, price="23")
 
     long_prefix = "opaque/" + "f" * 400
     for suffix in ("1", "2"):
@@ -101,10 +105,33 @@ def generate(root, seed):
         event(boundary + "a", "chunk-user", "bad", ingest=t)
         event(boundary + "a", "chunk-user", t, ingest=t + 1000)
         event(boundary + "b", "chunk-user", t, price="19")
+        for suffix, campaign in (("a", 3), ("b", 4)):
+            add("clicks", boundary + suffix, "chunk-user", f"c_{campaign}", str(t))
+        for i in range(800):
+            add("clicks", f"filler-{i}", "other-user", "c_0", str(t + 1))
+    if seed == 1:
+        # A busy shopper uses the radix path for both events and clicks. The two
+        # distant clusters form separate sessions and many clicks share a time.
+        for i in range(8400):
+            cluster = t + (3 * GAP if i % 2 else 0)
+            when = cluster + i % 4096
+            kind = "purchase" if i % 19 == 0 else "view"
+            event(f"busy-e{i}", "busy-user", when, f"p{i % 3}", "3", kind)
+            add("clicks", f"busy-c{i}", "busy-user", f"c_{i % 5}", str(cluster - i % 13))
     if end != END:
         event("wide", "fixture-A", end - DAY, "p0", "3")
         event("wide-view", "fixture-B", end - DAY + 1, "p1", "", "view")
-        add("clicks", "wide-click", "Fixture", "c_1", str(end - DAY))
+        # All three IDs tie on time. Comparing their entire byte strings changes
+        # the credited campaign, including for an ID with an embedded NUL.
+        for length, campaign in ((254, 2), (255, 1), (256, 3)):
+            add("clicks", "x" * 253 + "\x00" + "y" * (length - 254),
+                "Fixture", f"c_{campaign}", str(end - DAY))
+        # Exercise the last compact millisecond and the first wide one.
+        boundary = START - 7 * DAY + 2**32 - 1
+        for delta in (-1, 0):
+            who = f"boundary-user-{delta}"
+            event(f"click-boundary-{delta}", who, boundary + delta, price="11")
+            add("clicks", "q" * 256, who, "c_1", str(boundary + delta))
 
     for i in range(130):
         u = rng.choice(users)

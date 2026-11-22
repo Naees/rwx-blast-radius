@@ -2,377 +2,429 @@
 #include "csv.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <functional>
 #include <fcntl.h>
+#include <filesystem>
+#include <iostream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
-#include <vector>
 
 namespace shop {
 namespace {
 
-struct MappedFile {
-    char* data = nullptr;
-    std::size_t size = 0;
+constexpr uint32_t absent = UINT32_MAX;
+constexpr uint32_t detail_mask = (1u << 28) - 1;
+constexpr size_t block_rows = 1024;
+constexpr size_t input_chunk = 1 << 20;
 
-    explicit MappedFile(const std::filesystem::path& path) {
-        const int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) throw std::system_error(errno, std::generic_category(), path.string());
-        struct stat statbuf{};
-        if (::fstat(fd, &statbuf) != 0) {
-            int err = errno;
-            ::close(fd);
-            throw std::system_error(err, std::generic_category(), path.string());
-        }
-        size = static_cast<std::size_t>(statbuf.st_size);
-        if (size) {
-            data = static_cast<char*>(::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
-            if (data == MAP_FAILED) {
-                int err = errno;
-                ::close(fd);
-                throw std::system_error(err, std::generic_category(), path.string());
-            }
-        }
-        ::close(fd);
-    }
-    MappedFile(const MappedFile&) = delete;
-    MappedFile(MappedFile&& other) noexcept : data(other.data), size(other.size) { other.data = nullptr; }
-    ~MappedFile() { if (data) ::munmap(data, size); }
-};
-
-template <typename Function>
-void run_jobs(std::size_t workers, std::size_t jobs, Function&& function) {
-    std::atomic<std::size_t> next{0};
-    std::mutex error_mutex;
-    std::exception_ptr error;
-    auto work = [&](std::size_t worker) {
+template<class Function>
+void run_jobs(size_t threads, size_t count, Function function) {
+    std::atomic<size_t> next{0};
+    std::exception_ptr failure;
+    std::mutex mutex;
+    auto body = [&](size_t worker) {
         try {
-            while (true) {
-                const auto job = next.fetch_add(1, std::memory_order_relaxed);
-                if (job >= jobs) return;
-                function(worker, job);
-            }
+            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < count;)
+                function(worker, i);
         } catch (...) {
-            next.store(jobs, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> lock(error_mutex);
-            if (!error) error = std::current_exception();
+            next.store(count, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(mutex);
+            if (!failure) failure = std::current_exception();
         }
     };
-    std::vector<std::thread> threads;
-    for (std::size_t i = 1; i < std::min(workers, jobs); ++i) threads.emplace_back(work, i);
-    work(0);
-    for (auto& thread : threads) thread.join();
-    if (error) std::rethrow_exception(error);
+    std::vector<std::thread> pool;
+    for (size_t i = 1; i < std::min(count, threads); ++i) pool.emplace_back(body, i);
+    body(0);
+    for (auto& t : pool) t.join();
+    if (failure) std::rethrow_exception(failure);
 }
 
-const char* end_of_line(const char* p, const char* end) {
-    const auto* found = static_cast<const char*>(std::memchr(p, '\n', end - p));
-    return found ? found : end;
+template<class T>
+T load(const char* p) {
+    T result;
+    std::memcpy(&result, p, sizeof(result));
+    return result;
 }
 
-inline uint64_t mix(uint64_t a, uint64_t b) {
-    const auto prod = static_cast<__uint128_t>(a) * b;
-    return static_cast<uint64_t>(prod) ^ static_cast<uint64_t>(prod >> 64);
+uint64_t mix(uint64_t key) {
+    key ^= key >> 30;
+    key *= 0xbf58476d1ce4e5b9ULL;
+    key ^= key >> 27;
+    key *= 0x94d049bb133111ebULL;
+    return key ^ (key >> 31);
 }
 
-template <typename T>
-inline T load(const char* p) {
-    T x;
-    std::memcpy(&x, p, sizeof(x));
-    return x;
-}
-
-uint64_t key_hash(std::string_view s) {
-    constexpr uint64_t a = 0xa0761d6478bd642fULL, b = 0xe7037ed1a0b428dbULL;
-    uint64_t seed = s.size() ^ a;
-    const char* p = s.data();
-    std::size_t n = s.size();
-    while (n > 16) {
-        seed = mix(load<uint64_t>(p) ^ seed, load<uint64_t>(p + 8) ^ b);
-        n -= 16;
-        p += 16;
-    }
-    uint64_t first = 0, last = 0;
-    if (n >= 8) {
-        first = load<uint64_t>(p);
-        last = load<uint64_t>(p + n - 8);
-    } else if (n >= 4) {
-        first = load<uint32_t>(p);
-        last = load<uint32_t>(p + n - 4);
-    } else if (n) {
-        first = (uint64_t(static_cast<uint8_t>(p[0])) << 16) |
-                (uint64_t(static_cast<uint8_t>(p[n / 2])) << 8) | static_cast<uint8_t>(p[n - 1]);
-    }
-    return mix(first ^ b, last ^ seed);
-}
-
-// Unwrap the ID here. Quoting errors anywhere in the record are checked by parse_csv.
-std::string_view row_id(const char* p, std::size_t len) {
-    const char* comma = static_cast<const char*>(std::memchr(p, ',', len));
-    if (!comma) return {};
-    const char* stop = comma;
-    if (stop - p >= 2 && *p == '"' && stop[-1] == '"') { ++p; --stop; }
-    return {p, static_cast<std::size_t>(stop - p)};
-}
-
-struct Row {
-    uint32_t offset;
-    uint32_t length;
+struct Id {
+    uint64_t word, hash;
+    uint32_t mode;
 };
 
-struct Chunk {
-    const char* data;
-    const char* end;
-    const char* file_start;
-    const char* file_end;
-    std::vector<Row> rows;
+uint64_t inline_hash(uint64_t word, uint32_t mode) {
+    return mix(word ^ (0x9e3779b97f4a7c15ULL * mode));
+}
 
-    std::string_view line(const Row& row) const {
-        const char* p = data + row.offset;
-        if (row.length != UINT32_MAX) return {p, row.length};
-        // Only a chunk's final row can extend beyond its nominal 1 MiB.
-        return {p, static_cast<std::size_t>(end_of_line(p, file_end) - p)};
+// The mode preserves the original length, including trailing NUL bytes. A zero mode
+// stores the entire string in the partition. Equality is lossless in every mode.
+Id identify(std::string_view id) {
+    uint64_t word = 0;
+    uint32_t mode = 0;
+    if (id.size() <= 8) {
+        if (id.size() == 8) word = load<uint64_t>(id.data());
+        else std::memcpy(&word, id.data(), id.size());
+        mode = static_cast<uint32_t>(id.size());
+    } else if (id.size() == 9) {
+        word = load<uint64_t>(id.data());
+        uint64_t last = static_cast<uint8_t>(id[8]);
+        if (!(word & 0x8080808080808080ULL) && last < 128) {
+            // Scatter the ninth ASCII byte's seven bits into the eight preceding bytes' spare bits.
+            constexpr uint64_t copies = (1ULL << 7) | (1ULL << 14) | (1ULL << 21) | (1ULL << 28) |
+                                        (1ULL << 35) | (1ULL << 42) | (1ULL << 49);
+            word |= (last * copies) & 0x0080808080808080ULL;
+            mode = 9;
+        }
     }
+    uint64_t hash = mode ? inline_hash(word, mode) : std::hash<std::string_view>{}(id);
+    return {word, hash, mode};
+}
+
+struct Candidate {
+    uint64_t key;
+    uint32_t ingest, person, offset, meta;
+
+    uint32_t id_mode() const { return meta >> 28; }
+    uint32_t detail_index() const { return meta & detail_mask; }
+};
+static_assert(sizeof(Candidate) == 24);
+struct Detail {
+    int64_t ingest, ts;
+    uint32_t category, price;
 };
 
-struct Key {
-    uint32_t hash;
-    uint32_t chunk;
-    uint32_t row;
+struct Partition {
+    size_t count = 0;
+    std::vector<std::unique_ptr<Candidate[]>> blocks;
+    std::vector<char> strings;
+    std::vector<Detail> details;
+
+    Candidate& push(Candidate row) {
+        if (count % block_rows == 0) blocks.emplace_back(new Candidate[block_rows]);
+        Candidate& saved = blocks.back()[count % block_rows];
+        saved = row;
+        ++count;
+        return saved;
+    }
+    template<class Function>
+    void each(Function visit) {
+        size_t left = count;
+        for (auto& block : blocks) {
+            size_t size = std::min(left, block_rows);
+            for (size_t i = 0; i < size; ++i) visit(block[i]);
+            left -= size;
+        }
+    }
+    uint64_t save_string(std::string_view id, uint32_t hash) {
+        // An arena entry contains a length, the low hash bits, and the original bytes.
+        const size_t base = strings.size();
+        strings.resize(base + 12 + id.size());
+        char* p = strings.data() + base;
+        uint64_t len = id.size();
+        std::memcpy(p, &len, 8);
+        std::memcpy(p + 8, &hash, 4);
+        std::memcpy(p + 12, id.data(), id.size());
+        return base;
+    }
+    std::string_view string(uint64_t offset) const {
+        const char* p = strings.data() + offset;
+        return {p + 12, static_cast<size_t>(load<uint64_t>(p))};
+    }
+    uint32_t slot_hash(const Candidate& r) const {
+        if (r.id_mode()) return static_cast<uint32_t>(inline_hash(r.key, r.id_mode()));
+        return load<uint32_t>(strings.data() + r.key + 8);
+    }
+    const Detail& detail(const Candidate& r) const { return details[r.detail_index() - 1]; }
 };
 
-uint32_t parse_price(std::string_view value) {
-    uint32_t cents = 0;
-    for (unsigned char c : value) {
-        const unsigned digit = c - static_cast<unsigned>('0');
-        if (digit > 9 || cents > 1000000) return 0;
-        cents = cents * 10 + digit;
+struct File {
+    int fd;
+    size_t bytes;
+    explicit File(const std::filesystem::path& p) : fd(-1), bytes(std::filesystem::file_size(p)) {
+        fd = ::open(p.c_str(), O_RDONLY);
+        if (fd < 0) throw std::system_error(errno, std::generic_category(), p.string());
     }
-    return cents <= 10000000 ? cents : 0;
+    File(File&& other) noexcept : fd(other.fd), bytes(other.bytes) { other.fd = -1; }
+    ~File() { if (fd >= 0) ::close(fd); }
+};
+
+void read_bytes(const File& file, size_t at, size_t n, char* dest) {
+    while (n) {
+        auto got = ::pread(file.fd, dest, n, static_cast<off_t>(at));
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) throw std::system_error(errno, std::generic_category(), "event pread");
+        if (!got) throw std::runtime_error("events file shortened during scan");
+        n -= got;
+        at += got;
+        dest += got;
+    }
+}
+
+// A row belongs to the chunk containing its first byte. Read beyond the nominal
+// boundary to finish that row, even when it spans multiple chunks or ends at EOF.
+template<class Function>
+void read_chunk(const File& file, size_t start, std::vector<char>& buffer, Function process) {
+    size_t base = start ? start - 1 : 0;
+    size_t logical_end = std::min(file.bytes, start + input_chunk) - base;
+    size_t end = std::min(file.bytes - base, logical_end + 512);
+    buffer.resize(end);
+    read_bytes(file, base, end, buffer.data());
+    size_t pos = start - base;
+    if (start == 0 || buffer[pos - 1] != '\n') {
+        const char* nl = static_cast<const char*>(std::memchr(buffer.data() + pos, '\n', logical_end - pos));
+        if (!nl) return;
+        pos = nl - buffer.data() + 1;
+    }
+    while (pos < logical_end) {
+        size_t look = pos;
+        size_t line_end;
+        for (;;) {
+            const char* nl = static_cast<const char*>(std::memchr(buffer.data() + look, '\n', end - look));
+            if (nl) {
+                line_end = nl - buffer.data();
+                break;
+            }
+            if (end == file.bytes - base) {
+                line_end = end;
+                break;
+            }
+            look = end;
+            end = std::min(file.bytes - base, end + input_chunk);
+            buffer.resize(end);
+            read_bytes(file, base + look, end - look, buffer.data() + look);
+        }
+        process(std::string_view(buffer.data() + pos, line_end - pos));
+        pos = line_end + 1;
+    }
 }
 
 struct IngestDates {
-    struct Day {
-        char prefix[10]{};
-        int64_t start_ms = 0;
+    struct Item {
+        char date[10]{};
+        int64_t seconds = 0;
     };
-    std::array<Day, 32> dates{};
-
-    bool on_time(int64_t event_ms, std::string_view ingest) {
-        // ingest_ts is guaranteed valid UTC F1. When its midnight is at or before the
-        // event, every time on that date passes the 24-hour limit.
-        constexpr int64_t day_ms = 86400000;
-        if (ingest.size() != 20) return false;
-        const char* p = ingest.data();
-        const unsigned slot = (static_cast<unsigned char>(p[8]) * 10 + static_cast<unsigned char>(p[9])) & 31;
-        auto& date = dates[slot];
-        if (std::memcmp(date.prefix, p, sizeof(date.prefix)) != 0) {
-            const auto full_ms = parse_timestamp(ingest);
-            if (full_ms == invalid_timestamp) return false;
-            int64_t days = full_ms / day_ms - (full_ms % day_ms < 0);
-            date.start_ms = days * day_ms;
-            std::memcpy(date.prefix, p, sizeof(date.prefix));
+    std::array<Item, 32> table{};
+    int64_t seconds(std::string_view s) {
+        // The spec guarantees that every retained ingest timestamp is valid UTC F1.
+        const char* p = s.data();
+        auto& item = table[(p[8] * 10 + p[9]) & 31];
+        if (std::memcmp(item.date, p, 10)) {
+            auto t = parse_timestamp(s) / 1000;
+            item.seconds = (t / 86400 - (t % 86400 < 0)) * 86400;
+            std::memcpy(item.date, p, 10);
         }
-        if (date.start_ms <= event_ms) return true;
-        const int64_t elapsed = date.start_ms - event_ms;
-        if (elapsed > day_ms) return false;
-        const unsigned sec = digit_pair(p + 11) * 3600 + digit_pair(p + 14) * 60 + digit_pair(p + 17);
-        return elapsed + sec * 1000 <= day_ms;
+        return item.seconds + digit_pair(p + 11) * 3600 + digit_pair(p + 14) * 60 + digit_pair(p + 17);
+    }
+};
+uint32_t parse_price(std::string_view s) {
+    uint32_t n = 0;
+    for (unsigned char c : s) {
+        unsigned digit = c - unsigned('0');
+        if (digit > 9 || n > 1000000) return 0;
+        n = n * 10 + digit;
+    }
+    return n <= 10000000 ? n : 0;
+}
+
+struct alignas(128) Reader {
+    std::vector<Partition> partitions;
+    std::vector<char> buffer;
+    IngestDates dates;
+    struct PendingName {
+        Candidate* candidate;
+        size_t offset, length;
+    };
+    std::array<PendingName, Inputs::lookup_batch_size> pending;
+    size_t used = 0;
+
+    void flush(const Inputs& inputs) {
+        if (!used) return;
+        std::array<std::string_view, Inputs::lookup_batch_size> names;
+        std::array<uint32_t, Inputs::lookup_batch_size> ids;
+        for (size_t i = 0; i < used; ++i)
+            names[i] = {buffer.data() + pending[i].offset, pending[i].length};
+        inputs.resolve_people(names.data(), ids.data(), used);
+        for (size_t i = 0; i < used; ++i) pending[i].candidate->person = ids[i];
+        used = 0;
+    }
+    void queue(const Inputs& inputs, Candidate& c, std::string_view name) {
+        // Offsets survive buffer growth for a long record. read_chunk flushes before the next overwrite.
+        pending[used++] = {&c, static_cast<size_t>(name.data() - buffer.data()), name.size()};
+        if (used == pending.size()) flush(inputs);
     }
 };
 
-void validate_event(std::size_t worker, IngestDates& dates, std::string_view line, int64_t start_ms, int64_t end_ms,
-                    const EventConsumer& consume) {
+void parse_line(const Inputs& inputs, Reader& reader, std::string_view line, size_t buckets) {
     std::array<std::string_view, 7> f;
-    if (!parse_csv(line, f) || f[1].empty() || f[5].empty()) return;
-    const auto ts = parse_timestamp(f[2]);
-    if (ts < start_ms || ts >= end_ms || ts == invalid_timestamp) return;
-    if (!dates.on_time(ts, f[3])) return;
-    uint32_t cents = 0;
-    if (f[4] == "purchase") {
-        cents = parse_price(f[6]);
-        if (!cents) return;
-    } else if (f[4] != "cart" && f[4] != "view") return;
-    consume(worker, f[1], ts, f[5], cents);
+    if (!parse_csv(line, f) || f[0].empty()) return;
+    const Id id = identify(f[0]);
+    auto& part = reader.partitions[(id.hash >> 32) & (buckets - 1)];
+    uint64_t key = id.mode ? id.word : part.save_string(f[0], static_cast<uint32_t>(id.hash));
+    Candidate row{key, 0, absent, 0, id.mode << 28};
+
+    if (f[3].size() != 20) throw std::runtime_error("ingest timestamp violates F1 input guarantee");
+    const int64_t ingest = reader.dates.seconds(f[3]);
+    const int64_t encoded = ingest - inputs.window_start / 1000 + INT32_MAX;
+    row.ingest = encoded >= 0 && encoded < UINT32_MAX ? static_cast<uint32_t>(encoded) : absent;
+
+    const int64_t ts = parse_timestamp(f[2]);
+    const bool purchase = f[4] == "purchase";
+    const uint32_t cents = purchase ? parse_price(f[6]) : 0;
+    const bool type_ok = purchase ? cents > 0 : f[4] == "view" || f[4] == "cart";
+    const bool valid = !f[1].empty() && !f[5].empty() && type_ok &&
+                       ts != invalid_timestamp && ts >= inputs.window_start && ts < inputs.window_end &&
+                       ingest * 1000 - ts <= 86400000;
+
+    bool wide = false;
+    uint32_t category = 0;
+    if (valid) {
+        uint64_t offset = static_cast<uint64_t>(ts - inputs.window_start);
+        row.offset = static_cast<uint32_t>(offset);
+        wide = offset > UINT32_MAX;
+        if (purchase) category = inputs.product_category(f[5]);
+    }
+    if ((valid && (purchase || wide)) || row.ingest == absent) {
+        part.details.push_back({ingest, ts, category, cents});
+        if (part.details.size() > detail_mask)
+            throw std::length_error("too many event details in one partition");
+        row.meta |= static_cast<uint32_t>(part.details.size());
+    }
+    // Even an invalid event participates in deduplication. Its absent person ID
+    // suppresses a later valid copy when this is the earliest ingestion.
+    Candidate& saved = part.push(row);
+    if (valid) reader.queue(inputs, saved, f[1]);
+}
+
+// Ingestion timestamps normally fit in a biased 32-bit seconds offset. Outliers
+// retain the full 64-bit value in the detail record, including for invalid events.
+bool earlier(const Partition& current_part, const Candidate& current,
+             const Partition& previous_part, const Candidate& previous, int64_t base) {
+    if (current.ingest != absent && previous.ingest != absent)
+        return current.ingest < previous.ingest;
+    int64_t current_time = current.ingest == absent ? current_part.detail(current).ingest : base + current.ingest;
+    int64_t previous_time = previous.ingest == absent ? previous_part.detail(previous).ingest : base + previous.ingest;
+    return current_time < previous_time;
+}
+
+void deduplicate(std::vector<Reader>& readers, size_t bucket, WorkerEvents& output, int64_t window_start) {
+    struct Slot {
+        Candidate* winner = nullptr;
+        uint32_t reader, hash;
+    };
+    size_t count = 0;
+    for (const auto& reader : readers) count += reader.partitions[bucket].count;
+    size_t capacity = 4;
+    while (capacity < count + count / 3) capacity *= 2;
+    std::vector<Slot> slots(capacity);
+    const int64_t ingest_base = window_start / 1000 - INT32_MAX;
+    for (uint32_t k = 0; k < readers.size(); ++k) {
+        auto& part = readers[k].partitions[bucket];
+        part.each([&](Candidate& row) {
+            const uint32_t hash = part.slot_hash(row);
+            size_t index = hash & (capacity - 1);
+            while (slots[index].winner) {
+                auto& slot = slots[index];
+                auto& incumbent = *slot.winner;
+                if (hash == slot.hash && row.id_mode() == incumbent.id_mode()) {
+                    auto& owner = readers[slot.reader].partitions[bucket];
+                    bool same = row.id_mode() ? row.key == incumbent.key :
+                                               part.string(row.key) == owner.string(incumbent.key);
+                    if (same) {
+                        if (earlier(part, row, owner, incumbent, ingest_base)) {
+                            incumbent.person = absent;
+                            slot = {&row, k, hash};
+                        } else {
+                            row.person = absent;
+                        }
+                        return;
+                    }
+                }
+                index = (index + 1) & (capacity - 1);
+            }
+            slots[index] = {&row, k, hash};
+        });
+    }
+    for (auto& reader : readers) {
+        auto& part = reader.partitions[bucket];
+        part.each([&](const Candidate& row) {
+            if (row.person == absent) return;
+            Event event{window_start + row.offset, row.person, 0, 0};
+            if (row.detail_index()) {
+                const auto& detail = part.detail(row);
+                event = {detail.ts, row.person, detail.category, detail.price};
+            }
+            output.add(window_start, event);
+        });
+        part = {};
+    }
 }
 
 } // namespace
 
-struct EventBatch::Storage {
-    std::size_t nthreads = 1;
-    std::vector<MappedFile> files;
-    std::vector<Chunk> chunks;
-};
-
-EventBatch::~EventBatch() = default;
-
-EventBatch::EventBatch(const std::filesystem::path& data_dir, std::size_t nthreads)
-    : storage_(std::make_unique<Storage>()) {
-    auto& files = storage_->files;
-    auto& chunks = storage_->chunks;
-    nthreads = std::max<std::size_t>(1, nthreads);
-    std::size_t total_bytes = 0;
-    constexpr std::size_t chunk_size = 1 << 20;
-    for (const auto& entry : std::filesystem::directory_iterator(data_dir / "events")) {
+void read_events(const std::filesystem::path& data_dir, const Inputs& inputs,
+                 std::vector<WorkerEvents>& workers) {
+    const size_t threads = workers.size();
+    const bool profile = std::getenv("SHOP_PROFILE") != nullptr;
+    auto stage_start = std::chrono::steady_clock::now();
+    auto checkpoint = [&](const char* stage) {
+        if (!profile) return;
+        auto now = std::chrono::steady_clock::now();
+        std::cerr << stage << " " << std::chrono::duration<double>(now - stage_start).count() << " s\n";
+        stage_start = now;
+    };
+    struct Task { size_t file, offset; };
+    std::vector<File> files;
+    std::vector<Task> tasks;
+    size_t bytes = 0;
+    for (auto& entry : std::filesystem::directory_iterator(data_dir / "events")) {
         if (entry.path().extension() != ".csv") continue;
+        size_t file = files.size();
         files.emplace_back(entry.path());
-        auto& file = files.back();
-        if (!file.size) continue;
-        total_bytes += file.size;
-        const char* end = file.data + file.size;
-        for (const char* p = file.data; p < end;) {
-            const char* next = p + std::min<std::size_t>(end - p, chunk_size);
-            chunks.push_back({p, next, file.data, end, {}});
-            p = next;
-        }
+        bytes += files.back().bytes;
+        for (size_t offset = 0; offset < files.back().bytes; offset += input_chunk)
+            tasks.push_back({file, offset});
     }
-    if (chunks.empty()) return;
-    storage_->nthreads = nthreads = std::min(nthreads, chunks.size());
-    std::size_t bucket_count = 1;
-    while (bucket_count < 1024 && bucket_count * (2U << 20) < total_bytes) bucket_count *= 2;
-    using Buckets = std::vector<std::vector<Key>>;
-    std::vector<Buckets> keys(nthreads, Buckets(bucket_count));
-    run_jobs(nthreads, chunks.size(), [&](std::size_t worker, std::size_t i) {
-        auto& chunk = chunks[i];
-        chunk.rows.reserve(static_cast<std::size_t>(chunk.end - chunk.data) / 78 + 16);
-        const char* p = chunk.data;
-        // Each row belongs to the chunk containing its first byte. Skip the file header
-        // or a partial row at the front without touching the next chunk's pages.
-        if (p == chunk.file_start || p[-1] != '\n') {
-            const char* stop = end_of_line(p, chunk.end);
-            if (stop == chunk.end) return;
-            p = stop + 1;
-        }
-        while (p < chunk.end) {
-            const char* stop = end_of_line(p, chunk.file_end);
-            const auto len = static_cast<std::size_t>(stop - p);
-            const auto id = row_id(p, len);
-            if (!id.empty()) {
-                const auto hash = key_hash(id);
-                auto& bucket = keys[worker][hash & (bucket_count - 1)];
-                bucket.push_back({static_cast<uint32_t>(hash >> 32), static_cast<uint32_t>(i),
-                                  static_cast<uint32_t>(chunk.rows.size())});
-                chunk.rows.push_back({static_cast<uint32_t>(p - chunk.data),
-                                      static_cast<uint32_t>(std::min<std::size_t>(len, UINT32_MAX))});
-            }
-            p = stop < chunk.file_end ? stop + 1 : stop;
-        }
+    size_t buckets = 1;
+    while (buckets < 1024 && buckets * (4u << 20) < bytes) buckets *= 2;
+    std::vector<Reader> readers(threads);
+    for (auto& r : readers) r.partitions.resize(buckets);
+    run_jobs(threads, tasks.size(), [&](size_t worker, size_t i) {
+        auto& r = readers[worker];
+        auto task = tasks[i];
+        read_chunk(files[task.file], task.offset, r.buffer, [&](std::string_view line) {
+            parse_line(inputs, r, line, buckets);
+        });
+        r.flush(inputs);
     });
-
-    // Gather repeated fingerprints separately. Most rows need no exact ID comparison.
-    // Delay fetching their CSV bytes until every candidate can be read by file offset.
-    constexpr uint32_t none = UINT32_MAX;
-    struct Hit {
-        uint32_t chunk, row, group;
-        uint32_t next = UINT32_MAX;
-        int64_t ingest = 0;
-        std::string id;
-        bool keep = false;
-    };
-    struct Collisions {
-        std::vector<Hit> hits;
-        uint32_t groups = 0;
-    };
-    std::vector<Collisions> collisions(bucket_count);
-    run_jobs(nthreads, bucket_count, [&](std::size_t, std::size_t bucket) {
-        std::size_t count = 0;
-        for (auto& worker : keys) count += worker[bucket].size();
-        if (count < 2) return;
-        std::size_t capacity = 4;
-        while (capacity < count + count / 3) capacity *= 2;
-        struct Slot { const Key* first = nullptr; uint32_t group = UINT32_MAX; };
-        std::vector<Slot> slots(capacity);
-        auto& out = collisions[bucket];
-        auto add = [&](const Key& k, uint32_t group) {
-            out.hits.emplace_back();
-            auto& hit = out.hits.back();
-            hit.chunk = k.chunk;
-            hit.row = k.row;
-            hit.group = group;
-        };
-        for (auto& worker : keys) {
-            for (const auto& candidate : worker[bucket]) {
-                std::size_t slot = candidate.hash & (capacity - 1);
-                while (slots[slot].first && slots[slot].first->hash != candidate.hash)
-                    slot = (slot + 1) & (capacity - 1);
-                auto& entry = slots[slot];
-                if (!entry.first) { entry.first = &candidate; continue; }
-                if (entry.group == none) {
-                    entry.group = out.groups++;
-                    add(*entry.first, entry.group);
-                }
-                add(candidate, entry.group);
-            }
-        }
+    checkpoint("stream CSV and identify");
+    size_t rows = 0;
+    for (auto& r : readers) {
+        for (auto& p : r.partitions) rows += p.count;
+        std::vector<char>().swap(r.buffer);
+    }
+    for (auto& worker : workers) worker.reserve(inputs.person_count(), rows / threads + 1);
+    run_jobs(threads, buckets, [&](size_t worker, size_t bucket) {
+        deduplicate(readers, bucket, workers[worker], inputs.window_start);
     });
-    keys.clear();
-
-    std::vector<std::vector<Hit*>> reads(chunks.size());
-    for (auto& out : collisions)
-        for (auto& hit : out.hits) reads[hit.chunk].push_back(&hit);
-    run_jobs(nthreads, chunks.size(), [&](std::size_t, std::size_t i) {
-        auto& chunk = chunks[i];
-        const auto& records = reads[i];
-        if (records.empty()) return;
-        // Rows already have dense per-chunk ordinals. This staging array orders
-        // the small suspect set without chasing pointers in a comparison sort.
-        std::vector<Hit*> ordered(chunk.rows.size(), nullptr);
-        for (Hit* hit : records) ordered[hit->row] = hit;
-        std::array<std::string_view, 7> fields;
-        for (auto* hit : ordered) {
-            if (!hit || !parse_csv(chunk.line(chunk.rows[hit->row]), fields)) continue;
-            hit->id.assign(fields[0]);
-            hit->ingest = parse_timestamp(fields[3]);
-        }
-    });
-
-    run_jobs(nthreads, collisions.size(), [&](std::size_t, std::size_t b) {
-        auto& out = collisions[b];
-        std::vector<uint32_t> heads(out.groups, none);
-        for (uint32_t j = 0; j < out.hits.size(); ++j) {
-            auto& hit = out.hits[j];
-            if (hit.id.empty()) continue;
-            auto* head = &heads[hit.group];
-            while (*head != none && out.hits[*head].id != hit.id) head = &out.hits[*head].next;
-            if (*head == none) {
-                *head = j;
-                hit.keep = true;
-            } else if (hit.ingest < out.hits[*head].ingest) {
-                auto& old = out.hits[*head];
-                old.keep = false;
-                hit.keep = true;
-                hit.next = old.next;
-                *head = j;
-            }
-        }
-    });
-    run_jobs(nthreads, chunks.size(), [&](std::size_t, std::size_t i) {
-        for (const auto* hit : reads[i]) if (!hit->keep) chunks[i].rows[hit->row].offset = UINT32_MAX;
-    });
-}
-
-void EventBatch::consume(int64_t start_ms, int64_t end_ms, const EventConsumer& consume) const {
-    const auto& chunks = storage_->chunks;
-    run_jobs(storage_->nthreads, chunks.size(), [&](std::size_t worker, std::size_t i) {
-        const auto& chunk = chunks[i];
-        IngestDates dates;
-        for (const auto& row : chunk.rows) {
-            if (row.offset != UINT32_MAX) validate_event(worker, dates, chunk.line(row), start_ms, end_ms, consume);
-        }
-    });
-}
-
-std::size_t EventBatch::row_count() const {
-    std::size_t count = 0;
-    for (const auto& chunk : storage_->chunks) count += chunk.rows.size();
-    return count;
+    checkpoint("stream deduplicate and collect");
 }
 
 } // namespace shop

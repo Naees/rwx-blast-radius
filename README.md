@@ -65,7 +65,8 @@ The benchmark uses an external monotonic clock around each fresh process and a f
 ## Implementation
 
 - Link components use the bytewise smallest member as the person's ID, including aliases that appear only in the link files.
-- Event indexing runs alongside identity and click loading. Workers partition candidates by a hash of the event ID, compare original bytes on hash collisions, and choose the earliest well-formed copy before applying event validation.
+- Workers read event CSVs in 1 MiB chunks. Each well-formed row with a nonempty event ID retains its ingestion time, including rows whose event values fail validation. Within each hash partition, exact ID comparison selects the earliest copy. An invalid winner suppresses every later copy.
+- Event IDs up to eight bytes store their length and raw bytes directly. Nine-byte ASCII IDs pack losslessly into 63 bits. Longer or non-ASCII nine-byte IDs retain their original bytes in partition-local storage. Hashes select candidate slots, and equality compares the full ID.
 - Per-person time ordering determines session starts. Equal-time clicks use bytewise click-ID order. For assists, each campaign gets credit for the union of sessions covered by its clicks, including campaigns that never win a session.
 - Parallel column writers emit both tables with UTC dates, integer revenue in cents and a nullable top category.
 

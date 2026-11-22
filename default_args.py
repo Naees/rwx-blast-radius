@@ -13,6 +13,7 @@ from pathlib import Path
 from mapdata import load
 
 MAP = Path(__file__).with_name("maps") / "default_args.json.gz"
+VALUES = MAP.with_name("default_values.json.gz")
 SCALARS = (bool, int, float, str, bytes, type(None))
 
 
@@ -411,6 +412,27 @@ def profile(base):
     return load(MAP) if MAP.exists() else build(base)
 
 
+@lru_cache(1)
+def _bound_values():
+    if not VALUES.is_file():
+        return None
+    data = load(VALUES)
+    tests = {name: 1 << i for i, name in enumerate(data["tests"])}
+    return tests, int(data["unmeasured"], 16), data["masks"]
+
+
+def _possible_default(calls, path, number, column):
+    observed = _bound_values()
+    if observed is None:
+        return calls
+    tests, unmeasured, masks = observed
+    mask = masks.get(f"{path}:{number}:{column}")
+    if mask is None:
+        return calls
+    possible = int(mask, 16) | unmeasured
+    return {name for name in calls if name not in tests or tests[name] & possible}
+
+
 def select(patch, source, base, deps):
     if (
         patch.binary
@@ -465,7 +487,7 @@ def select(patch, source, base, deps):
             return None
         calls = set().union(*(deps.line(patch.path, n) for n in body))
         if calls:
-            return calls | observers
+            return _possible_default(calls, patch.path, number, begin) | observers
     return None
 
 

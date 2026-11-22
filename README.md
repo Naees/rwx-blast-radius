@@ -19,6 +19,8 @@ Separate maps track class attributes, registry lookups, fixture reads, Python fi
 
 For edits to an `isinstance` check, the selector compares the old and new class arguments against the inheritance chains observed at that call. When a Boolean class flag changes, it can also rule out tests where the surrounding condition would have taken the same branch for either flag value. For an eligible change to a function's default argument it checks whether the body uses the parameter and which callers were measured. A comment in a compound patch can still select tests that read that Python file as data.
 
+An integer index edit can leave a test unaffected when both indices refer to the same object in every observed list or tuple. A changed default can likewise leave a caller unaffected if it supplied an explicit argument. For expensive TPC tests, the selector also checks observed function signatures and object types before replaying optimizer stages.
+
 The selector can run candidate tests in a temporary checkout containing the patch. For a single-file source edit it uses baseline coverage to narrow independent SQL fixture rows and dialect assertions. For selected expensive tests it can replay optimizer stages, compare the resulting trees with the baseline, or run individual executor queries against DuckDB. For edits to fixture data it distinguishes the input SQL, expected SQL and metadata a test consumed. Probe failures and timeouts leave unverified tests in the schedule.
 
 The prediction is empirical. New control flow, dynamic imports and differences between profiling and scoring environments can affect recall. The organizer's sample answers are used only by the external scorer.
@@ -50,9 +52,12 @@ python generate_bool_values.py "$BASE" "$TESTS" maps/bool_values.json.gz
 python generate_config_truth.py "$BASE" "$TESTS" maps/config_truth.json.gz
 python generate_class_checks.py "$BASE" "$TESTS" maps/class_checks.json.gz
 python default_args.py "$BASE" maps/default_args.json.gz
+python generate_default_values.py "$BASE" "$TESTS" maps/default_values.json.gz
+python generate_sequence_index.py "$BASE" "$TESTS" maps/sequence_index.json.gz
 python generate_registries.py "$BASE" "$TESTS" .work/registry-all.json.gz
 python pack_registries.py "$BASE" maps/registries.json.gz .work/registry-all.json.gz
 python optimizer_replay_build.py "$BASE"
+python generate_optimizer_witness.py "$BASE" maps/optimizer_witness.json.gz
 python executor_queries_build.py "$BASE"
 ```
 

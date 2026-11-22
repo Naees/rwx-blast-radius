@@ -1,5 +1,6 @@
 import difflib
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +26,57 @@ class Coverage:
 
 
 class TestDefaultArguments(unittest.TestCase):
+    def test_bound_values_retain_matching_unmeasured_and_new_tests(self):
+        data = ({"matches": 1, "explicit": 2, "unmeasured": 4}, 4, {"p:4:6": "1"})
+        callers = {"matches", "explicit", "unmeasured", "new"}
+        with patch.object(default_args, "_bound_values", return_value=data):
+            self.assertEqual(
+                default_args._possible_default(callers, "p", 4, 6),
+                {"matches", "unmeasured", "new"},
+            )
+            self.assertEqual(
+                default_args._possible_default(callers, "p", 8, 6), callers
+            )
+
+    def test_entry_probe_only_compares_exact_scalar_types(self):
+        from generate_default_values import DefaultValues
+
+        class Other:
+            def __eq__(self, value):
+                raise AssertionError("custom equality was called")
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            p = root / "sqlglot" / "sample.py"
+            p.parent.mkdir()
+            source = "def run(flag=True):\n    return flag\n"
+            p.write_text(source)
+            recorder = DefaultValues(
+                root, ["explicit", "matches"], default_args.build(root)
+            )
+            namespace = {}
+            exec(compile(source, str(p), "exec"), namespace)
+            run = namespace["run"]
+            sys.monitoring.use_tool_id(recorder.slot, "test default observer")
+            try:
+                sys.monitoring.register_callback(
+                    recorder.slot, sys.monitoring.events.PY_START, recorder.enter
+                )
+                recorder.attach("sqlglot/sample.py", run.__code__)
+                recorder.activate(recorder.bits["explicit"])
+                run(False)
+                run(Other())
+                recorder.activate(recorder.bits["matches"])
+                run()
+                recorder.passed.update(recorder.tests)
+                self.assertEqual(list(recorder.snapshot()["masks"].values()), ["0x2"])
+            finally:
+                sys.monitoring.set_local_events(recorder.slot, run.__code__, 0)
+                sys.monitoring.register_callback(
+                    recorder.slot, sys.monitoring.events.PY_START, None
+                )
+                sys.monitoring.free_tool_id(recorder.slot)
+
     def select(self, old, new, deps, consumers=""):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)

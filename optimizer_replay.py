@@ -215,7 +215,7 @@ def _budget(needed, candidates, cost):
     return {node: compact[node] for node in best}, best_budget
 
 
-def refine(patch, impact, initial_ids, base, cost=None):
+def _snapshots(patch, impact, initial_ids, base, cost=None):
     needed = required_calls(patch, impact, set(initial_ids))
     if not needed:
         return set()
@@ -231,3 +231,12 @@ def refine(patch, impact, initial_ids, base, cost=None):
     if not isinstance(result, list):
         return set()
     return set(result).intersection(needed)
+
+
+def refine(patch, impact, initial_ids, base, cost=None):
+    if not set(initial_ids).intersection(TARGETS):
+        return set()
+    from optimizer_witness import refine as local_equivalence
+    verified = local_equivalence(patch, impact, initial_ids, base)
+    remaining = set(initial_ids).difference(verified)
+    return verified | _snapshots(patch, impact, remaining, base, cost)

@@ -20,6 +20,7 @@ from mapdata import load as load_map
 from numeric import select as numeric_users
 from observations import Observations
 from registries import select as registry_users
+from sequence_index import select as index_users
 
 
 def schedule(tests):
@@ -128,6 +129,8 @@ class Selector:
                     hits = set().union(*groups, hits & self.observations.incomplete)
             if hits and not impact.global_change and registry is None:
                 checked = class_check_users(patch, source, hits)
+                if checked is None and allow_probe:
+                    checked = index_users(patch, source, hits, source_readers=self.deps.source_readers(path))
                 if checked is not None:
                     hits = checked
             for owner in initializers:

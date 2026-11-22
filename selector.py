@@ -7,7 +7,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from bool_values import affected as boolean_users
+from class_checks import select as class_check_users
 from configmap import select as select_config
+from default_args import select as default_users
 from deps import Dependencies
 from fixture_usage import select as fixture_users
 from fixtures import FixtureSelector
@@ -72,7 +74,7 @@ class Selector:
             source = self.source(patch.old_path) if patch.old_path else ""
             impact = analyze_python(patch, source)
             if impact.equivalent:
-                return set()
+                return set(self.deps.source_readers(path))
             if patch.old_path != patch.new_path:
                 return self.all
             if impact.invalid:
@@ -86,6 +88,8 @@ class Selector:
                 users = numeric_users(patch, source, self.deps)
                 if users is None:
                     users = select_config(patch, impact, source, self.deps)
+                if users is None:
+                    users = default_users(patch, source, self.base, self.deps)
                 # A fully resolved class assignment runs at import. The per-test
                 # dependency is at the consumer, not at the assignment line.
                 if registry is not None:
@@ -105,6 +109,10 @@ class Selector:
                     groups.append(group)
                 if all(group is not None for group in groups):
                     hits = set().union(*groups, hits & self.observations.incomplete)
+            if hits and not impact.global_change and registry is None:
+                checked = class_check_users(patch, source, hits)
+                if checked is not None:
+                    hits = checked
             for owner in initializers:
                 hits.update(self.import_users(owner))
             hits = (hits | set(self.deps.source_readers(path)) | (self.all - self.deps.tests)) & self.all
@@ -113,7 +121,7 @@ class Selector:
                 import optimizer_replay
                 import stress
                 import verification
-                hits -= optimizer_replay.refine(patch, impact, hits, self.base)
+                hits -= optimizer_replay.refine(patch, impact, hits, self.base, self.cost)
                 hits -= executor_queries.refine(patch, impact, hits, self.base, self.cost)
                 hits -= verification.refine(patch, impact, hits, self)
                 hits -= stress.refine(patch, impact, hits, self.base, self.inventory)
@@ -147,10 +155,29 @@ class Selector:
                 return hits
         return self.all
 
+    def _comment_only(self, patch):
+        if (patch.binary or patch.old_path != patch.new_path or not patch.path.startswith("sqlglot/")
+                or not patch.path.endswith(".py")):
+            return False
+        changed = (line[1:].strip() for hunk in patch.hunks for line in hunk.body if line[0] in "+-")
+        if any(line and not line.startswith("#") for line in changed):
+            return False
+        # A physical line beginning with '#' can be inside a string literal.
+        return analyze_python(patch, self.source(patch.path)).equivalent
+
     def predict(self, text):
         patches = parse_patch(text)
         if not patches:
             return self.all
+        raw_readers = set()
+        if len(patches) > 1 and len({p.path for p in patches}) == len(patches):
+            active = []
+            for patch in patches:
+                if self._comment_only(patch):
+                    raw_readers.update(self.deps.source_readers(patch.path))
+                else:
+                    active.append(patch)
+            patches = active
         hits = set()
         fixture_batch = all(p.path.startswith("tests/fixtures/") for p in patches)
         for patch in patches:
@@ -159,7 +186,7 @@ class Selector:
         if len(patches) > 1 and hits:
             import verification
             hits -= verification.refine_many(patches, hits, self)
-        return hits
+        return hits | (raw_readers & self.all)
 
 
 def main():

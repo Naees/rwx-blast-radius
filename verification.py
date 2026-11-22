@@ -10,8 +10,12 @@ def refine(patch, impact, candidates, selector):
 
 
 def refine_many(patches, candidates, selector):
-    if any(p.binary or p.old_path != p.new_path or not p.path.startswith("sqlglot/")
-           or not p.path.endswith(".py") for p in patches):
+    if not any(p.path.startswith("sqlglot/") for p in patches):
+        return set()
+    if any(p.binary or p.old_path != p.new_path or not (
+        (p.path.startswith("sqlglot/") and p.path.endswith(".py"))
+        or p.path.startswith("tests/fixtures/")
+    ) for p in patches):
         return set()
     if len({p.path for p in patches}) != len(patches):
         return set()
@@ -27,6 +31,16 @@ def _verify(patches, impact, candidates, selector):
                 and (costs[n] <= 1.5 or (n.startswith("tests/test_optimizer.py::") and costs[n] <= 2.6))}
     if not eligible:
         return set()
+    full = selector.cost(candidates)
+    db_nodes = {n for n in eligible if n.startswith(("tests/test_optimizer.py", "tests/test_executor.py"))}
+    if db_nodes:
+        # These classes create and populate a database before a single method
+        # runs. A smaller schedule cannot amortize a fresh database and imports.
+        removable = full - selector.cost(candidates - eligible)
+        if removable < 4.75:
+            eligible -= db_nodes
+            if not eligible:
+                return set()
     dialects = {n for n in eligible if n.startswith("tests/dialects/")}
     optimizers = {n for n in eligible if n.startswith("tests/test_optimizer.py::")}
     assertions, fixtures, ratios = {}, {}, {}
@@ -43,21 +57,19 @@ def _verify(patches, impact, candidates, selector):
         from config_sites import plans
         assertions, fixtures, ratios = plans(patch, impact, selector, dialects, optimizers)
     runtime = {n: costs[n] * ratios.get(n, 1.0) for n in eligible}
-    full = selector.cost(candidates)
-    # Starting the database-backed test classes costs more than their recorded
-    # per-method durations. Reserve that work for bigger schedules or for
-    # cases where coverage removed most of the expensive fixture rows.
-    db_nodes = {n for n in eligible if n.startswith(("tests/test_optimizer.py", "tests/test_executor.py"))}
-    if full < 4.75 and db_nodes and sum(runtime[n] for n in db_nodes) > .35:
-        eligible -= db_nodes
-        if not eligible:
-            return set()
+    def probe_budget(nodes):
+        fixed = candidates - nodes
+        # Compare two outcomes: all candidates pass, or the most expensive
+        # candidate still needs a worker. The latter is common on breaking edits.
+        clear_all = full - selector.cost(fixed)
+        longest = max(nodes, key=lambda n: (costs[n], n))
+        keep_one = max(0.0, full - selector.cost(fixed | {longest}))
+        return min(3.0, .35 * clear_all + .35 * keep_one)
 
     def worthwhile(nodes):
-        saving = full - selector.cost(candidates - nodes)
         # DB imports and class fixtures have a measurable fixed cost.
-        setup = .35 if any(n.startswith(("tests/test_optimizer", "tests/test_executor")) for n in nodes) else .12
-        return setup + sum(runtime[n] for n in nodes) < min(5, .8 * saving)
+        setup = 1.25 if db_nodes.intersection(nodes) else .15
+        return setup + sum(runtime[n] for n in nodes) < probe_budget(nodes)
 
     if not worthwhile(eligible):
         # A few slow but cheaply replayable tests can still dominate a worker's load.
@@ -73,13 +85,12 @@ def _verify(patches, impact, candidates, selector):
         return -sum(costs[n] for n in names) / (.04 + sum(runtime[n] for n in names))
     nodes = [n for group in sorted(groups, key=lambda g: (priority(groups[g]), g))
              for n in sorted(groups[group], key=lambda n: (priority([n]), n))]
-    saving = full - selector.cost(candidates - eligible)
     payload = {
         "nodes": nodes,
         "assertions": {n: assertions[n] for n in nodes if assertions.get(n)},
         "fixtures": {n: fixtures[n] for n in nodes if fixtures.get(n)},
         "stop_early": len(nodes) <= 8 and sum(costs[n] for n in nodes) < .4,
-        "cpu_budget": min(6.0, .8 * saving),
+        "cpu_budget": probe_budget(eligible),
     }
     changed = {p.path: p.apply(selector.source(p.path)) for p in patches}
     result = run(selector.base, changed, "query_checks", payload, timeout=8.0)
